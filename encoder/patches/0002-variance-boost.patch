@@ -1,0 +1,215 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-09-27 09:36:41
++++ b/av2/arg_defs.c	2026-09-27 09:48:40
+@@ -520,6 +520,12 @@
+   .base_uv_ac_delta_q = ARG_DEF(NULL, "base-uv-ac-delta-q", 1,
+                                 "Sequence-level chroma AC qindex offset, "
+                                 "-23..8 (0 = off)"),
++  .vb_strength = ARG_DEF(NULL, "vb-strength", 1,
++                         "Variance Boost strength in tenths, 0..60 (default 30)"),
++  .vb_octile = ARG_DEF(NULL, "vb-octile", 1,
++                       "Variance Boost octile of 8x8 variances, 1..8 (default 5)"),
++  .vb_max_boost = ARG_DEF(NULL, "vb-max-boost", 1,
++                          "Variance Boost cap in qindex steps (default 80)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-09-27 09:36:41
++++ b/av2/arg_defs.h	2026-09-27 09:48:40
+@@ -182,6 +182,9 @@
+   arg_def_t base_y_dc_delta_q;
+   arg_def_t base_uv_dc_delta_q;
+   arg_def_t base_uv_ac_delta_q;
++  arg_def_t vb_strength;
++  arg_def_t vb_octile;
++  arg_def_t vb_max_boost;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-09-27 09:36:41
++++ b/av2/av2_cx_iface.c	2026-09-27 09:48:40
+@@ -248,6 +248,9 @@
+   int base_y_dc_delta_q;
+   int base_uv_dc_delta_q;
+   int base_uv_ac_delta_q;
++  int vb_strength;
++  int vb_octile;
++  int vb_max_boost;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -580,6 +583,9 @@
+   0,      // base_y_dc_delta_q
+   0,      // base_uv_dc_delta_q
+   0,      // base_uv_ac_delta_q
++  30,     // vb_strength
++  5,      // vb_octile
++  80,     // vb_max_boost
+ };
+ // clang-format on
+ 
+@@ -1470,6 +1476,9 @@
+   q_cfg->base_y_dc_delta_q = extra_cfg->base_y_dc_delta_q;
+   q_cfg->base_uv_dc_delta_q = extra_cfg->base_uv_dc_delta_q;
+   q_cfg->base_uv_ac_delta_q = extra_cfg->base_uv_ac_delta_q;
++  q_cfg->vb_strength = clamp(extra_cfg->vb_strength, 0, 60);
++  q_cfg->vb_octile = clamp(extra_cfg->vb_octile, 1, 8);
++  q_cfg->vb_max_boost = clamp(extra_cfg->vb_max_boost, 0, 200);
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4065,6 +4074,15 @@
+                                   &g_av2_codec_arg_defs.base_uv_ac_delta_q,
+                                   argv, err_string)) {
+     extra_cfg.base_uv_ac_delta_q = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.vb_strength,
++                                  argv, err_string)) {
++    extra_cfg.vb_strength = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.vb_octile,
++                                  argv, err_string)) {
++    extra_cfg.vb_octile = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.vb_max_boost,
++                                  argv, err_string)) {
++    extra_cfg.vb_max_boost = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/aq_variance.c	2026-09-27 00:29:57
++++ b/av2/encoder/aq_variance.c	2026-09-27 09:48:40
+@@ -196,6 +196,59 @@
+ 
+ #define DEFAULT_E_MIDPOINT 10.0
+ 
++static int vb_cmp_uint(const void *a, const void *b) {
++  const unsigned int x = *(const unsigned int *)a;
++  const unsigned int y = *(const unsigned int *)b;
++  return (x > y) - (x < y);
++}
++
++// Variance Boost: the qindex this superblock should use. The variance kernels
++// already return 8-bit-scale values for 10/12-bit input (highbd_10_variance
++// shifts the sum of squares down), so no bit-depth normalization is applied.
++int av2_get_sbq_variance_boost(const AV2_COMP *cpi, MACROBLOCK *x,
++                               BLOCK_SIZE sb_size) {
++  const AV2_COMMON *const cm = &cpi->common;
++  const MACROBLOCKD *const xd = &x->e_mbd;
++  const int base_qindex = cm->quant_params.base_qindex;
++  if (base_qindex <= 0) return base_qindex;
++  const QuantizationCfg *const q_cfg = &cpi->oxcf.q_cfg;
++  const int right_overflow =
++      (xd->mb_to_right_edge < 0) ? ((-xd->mb_to_right_edge) >> 3) : 0;
++  const int bottom_overflow =
++      (xd->mb_to_bottom_edge < 0) ? ((-xd->mb_to_bottom_edge) >> 3) : 0;
++  const int bw = MI_SIZE * mi_size_wide[sb_size] - right_overflow;
++  const int bh = MI_SIZE * mi_size_high[sb_size] - bottom_overflow;
++  // 256x256 is the largest superblock: 32x32 = 1024 8x8 blocks
++  unsigned int vars[1024];
++  int n = 0;
++  for (int i = 0; i + 8 <= bh; i += 8) {
++    for (int j = 0; j + 8 <= bw; j += 8) {
++      unsigned int sse;
++      const unsigned int v = cpi->fn_ptr[BLOCK_8X8].vf(
++          x->plane[0].src.buf + i * x->plane[0].src.stride + j,
++          x->plane[0].src.stride, av2_highbd_all_zeros, 0, &sse);
++      vars[n++] = v / 64;
++    }
++  }
++  if (n == 0) return base_qindex;
++  qsort(vars, n, sizeof(vars[0]), vb_cmp_uint);
++  // the octile and its two neighbours, weighted 1:2:1 (libaom's combination)
++  const int step = AVMMAX(1, n / 8);
++  const int mid = clamp(q_cfg->vb_octile * n / 8 - 1, 0, n - 1);
++  const int lo = AVMMAX(0, mid - step), hi = AVMMIN(n - 1, mid + step);
++  unsigned int var = (vars[lo] + 2 * vars[mid] + vars[hi] + 2) / 4;
++  if (var == 0) var = 1;
++  const double strength = q_cfg->vb_strength / 10.0;
++  double ratio = 0.15 * strength * (10.0 - log2((double)var)) + 1.0;
++  ratio = fclamp(ratio, 1.0, 8.0);
++  if (ratio <= 1.0) return base_qindex;
++  const avm_bit_depth_t bd = cm->seq_params.bit_depth;
++  const double target_q = av2_convert_qindex_to_q(base_qindex, bd) / ratio;
++  int target = av2_find_qindex(target_q, bd, MINQ, base_qindex);
++  target = AVMMAX(target, base_qindex - q_cfg->vb_max_boost);
++  return AVMMAX(target, 1);
++}
++
+ static unsigned int haar_ac_energy(MACROBLOCK *x, BLOCK_SIZE bs) {
+   int stride = x->plane[0].src.stride;
+   uint16_t *buf = x->plane[0].src.buf;
+diff --avm
+--- a/av2/encoder/aq_variance.h	2026-09-27 00:29:57
++++ b/av2/encoder/aq_variance.h	2026-09-27 09:48:40
+@@ -27,6 +27,8 @@
+                       int mi_row, int mi_col
+ #endif  // CONFIG_MIXED_LOSSLESS_ENCODE
+ );
++int av2_get_sbq_variance_boost(const AV2_COMP *cpi, MACROBLOCK *x,
++                               BLOCK_SIZE sb_size);
+ int av2_compute_q_from_energy_level_deltaq_mode(const AV2_COMP *const cpi,
+                                                 int block_var_level);
+ int av2_block_wavelet_energy_level(const AV2_COMP *cpi, MACROBLOCK *x,
+diff --avm
+--- a/av2/encoder/encodeframe.c	2026-09-27 00:29:57
++++ b/av2/encoder/encodeframe.c	2026-09-27 09:48:40
+@@ -243,6 +243,8 @@
+       current_qindex =
+           av2_compute_q_from_energy_level_deltaq_mode(cpi, block_var_level);
+     }
++  } else if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_VARIANCE_BOOST) {
++    current_qindex = av2_get_sbq_variance_boost(cpi, x, sb_size);
+   } else if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_OBJECTIVE &&
+              cpi->oxcf.algo_cfg.enable_tpl_model) {
+     // Setup deltaq based on tpl stats
+@@ -253,8 +255,15 @@
+   const int delta_q_res = delta_q_info->delta_q_res;
+   // Right now aq only works with tpl model. So if tpl is disabled, we set the
+   // current_qindex to base_qindex.
+-  if (cpi->oxcf.algo_cfg.enable_tpl_model &&
+-      cpi->oxcf.q_cfg.deltaq_mode != NO_DELTA_Q) {
++  if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_VARIANCE_BOOST) {
++    // the bit depth's real qindex range, where the path below clamps at 256
++    const avm_bit_depth_t bd = cm->seq_params.bit_depth;
++    const int qrange = bd == AVM_BITS_8    ? QINDEX_RANGE_8_BITS
++                       : bd == AVM_BITS_10 ? QINDEX_RANGE_10_BITS
++                                           : QINDEX_RANGE;
++    current_qindex = clamp(current_qindex, delta_q_res, qrange - delta_q_res);
++  } else if (cpi->oxcf.algo_cfg.enable_tpl_model &&
++             cpi->oxcf.q_cfg.deltaq_mode != NO_DELTA_Q) {
+     current_qindex =
+         clamp(current_qindex, delta_q_res, 256 - delta_q_info->delta_q_res);
+   } else {
+@@ -2175,7 +2184,8 @@
+   if (cpi->oxcf.q_cfg.aq_mode != CYCLIC_REFRESH_AQ) {
+     if (deltaq_mode == DELTA_Q_OBJECTIVE)
+       cm->delta_q_info.delta_q_res = DEFAULT_DELTA_Q_RES_OBJECTIVE;
+-    else if (deltaq_mode == DELTA_Q_PERCEPTUAL)
++    else if (deltaq_mode == DELTA_Q_PERCEPTUAL ||
++             deltaq_mode == DELTA_Q_VARIANCE_BOOST)
+       cm->delta_q_info.delta_q_res = DEFAULT_DELTA_Q_RES_PERCEPTUAL;
+     // Set delta_q_present_flag before it is used for the first time
+     cm->delta_q_info.delta_q_present_flag = deltaq_mode != NO_DELTA_Q;
+diff --avm
+--- a/av2/encoder/encoder.h	2026-09-27 09:36:41
++++ b/av2/encoder/encoder.h	2026-09-27 09:48:40
+@@ -133,6 +133,7 @@
+   NO_DELTA_Q = 0,
+   DELTA_Q_OBJECTIVE = 1,   // Modulation to improve objective quality
+   DELTA_Q_PERCEPTUAL = 2,  // Modulation to improve perceptual quality
++  DELTA_Q_VARIANCE_BOOST = 3,  // Finer q for flat superblocks (still images)
+   DELTA_Q_MODE_COUNT       // This should always be the last member of the enum
+ } UENUM1BYTE(DELTAQ_MODE);
+ 
+@@ -769,6 +770,10 @@
+   int base_y_dc_delta_q;
+   int base_uv_dc_delta_q;
+   int base_uv_ac_delta_q;
++  // Variance Boost (deltaq-mode=3): strength in tenths, octile, max boost.
++  int vb_strength;
++  int vb_octile;
++  int vb_max_boost;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used

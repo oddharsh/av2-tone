@@ -41,6 +41,21 @@
 #
 #   ./build.sh            build if missing
 #   ./build.sh --force    rebuild from scratch
+#   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
+#                         the SIMDe kernels (see "THE TUNED BUILD" below)
+#
+# THE TUNED BUILD. patches/ holds five encoder-only changes to AVM, each off by
+# default and each decoded pixel-identically by the untouched reference decoder:
+#   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
+#   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
+#   0003 jpegli-mask     deltaq-mode=4, jpegli adaptive-quantization field
+#   0004 qm-curves       qm-curve / qm-chroma-curve, libaom still-image QM levels
+#   0005 qm-per-segment  qmseg: two QM sets split by texture, an AV2-only syntax
+# Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
+# refuses to finish unless the tuned binary, with every new option off, writes
+# BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
+# qmseg file pixel-identically. build/ itself stays pristine on purpose: it is
+# the reference decoder every one of those controls is judged by.
 set -euo pipefail
 
 LIBAVIF_REV="768b3dfe30da63265eb31dad6f79fc7662f65b42"
@@ -52,11 +67,13 @@ AVIFENC="$OUT/avifenc"
 
 if [ "${1:-}" = "--force" ]; then rm -rf "$SRC" "$OUT"; fi
 
-if [ -x "$AVIFENC" ] && [ -x "$OUT/avifdec" ]; then
+if [ -x "$AVIFENC" ] && [ -x "$OUT/avifdec" ] && [ "${1:-}" != "--tuned" ]; then
   echo "AV2 avifenc already built: $AVIFENC"
   "$AVIFENC" --version | sed -n '1p'
   exit 0
 fi
+
+if [ ! -x "$AVIFENC" ] || [ ! -x "$OUT/avifdec" ]; then
 
 for cmd in cmake ninja git pkg-config; do
   command -v "$cmd" >/dev/null 2>&1 || {
@@ -102,3 +119,60 @@ fi
 
 echo "built: $AVIFENC (and avifdec beside it)"
 "$AVIFENC" --version | sed -n '1p'
+fi
+[ "${1:-}" = "--tuned" ] || exit 0
+
+# ---- the tuned build ---------------------------------------------------------
+# SIMDe v0.8.2, pinned by commit like everything else here.
+SIMDE_REV="71fd833d9666141edcd1d3c109a80e228303d8d7"
+TUNED="$OUT/tuned"
+TSRC="$OUT/tuned-src"
+SIMDE_DIR="$OUT/simde"
+PRISTINE_AVM="$OUT/_deps/libavm-src"
+[ -d "$PRISTINE_AVM" ] || { echo "error: $PRISTINE_AVM missing; rerun with --force" >&2; exit 1; }
+
+rm -rf "$TUNED" "$TSRC"
+cp -R "$PRISTINE_AVM" "$TSRC"
+for p in "$SCRIPT_DIR"/patches/*.patch; do
+  patch -p1 -s -d "$TSRC" < "$p" || { echo "error: $(basename "$p") does not apply" >&2; exit 1; }
+done
+
+if [ ! -d "$SIMDE_DIR/.git" ]; then
+  echo "fetching SIMDe $SIMDE_REV…" >&2
+  rm -rf "$SIMDE_DIR"
+  git init -q "$SIMDE_DIR"
+  git -C "$SIMDE_DIR" remote add origin https://github.com/simd-everywhere/simde.git
+  git -C "$SIMDE_DIR" fetch -q --depth 1 origin "$SIMDE_REV" >&2
+  git -C "$SIMDE_DIR" checkout -q FETCH_HEAD
+fi
+
+cmake -G Ninja -S "$SRC" -B "$TUNED" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DAVIF_CODEC_AVM=LOCAL \
+  -DAVIF_CODEC_AOM=SYSTEM \
+  -DAVIF_LIBYUV=LOCAL \
+  -DAVIF_LIBSHARPYUV=OFF \
+  -DAVIF_BUILD_APPS=ON \
+  -DAVIF_JPEG=SYSTEM \
+  -DAVIF_ZLIBPNG=SYSTEM \
+  -DFETCHCONTENT_SOURCE_DIR_LIBAVM="$TSRC" >&2
+cmake --build "$TUNED" --target avifenc avifdec >&2
+bun "$SCRIPT_DIR/simde.ts" --src "$TSRC" --build "$TUNED" --simde "$SIMDE_DIR" --work "$OUT/simde-work" >&2
+
+# THE GATE. A committed 600px tier is the input, so it needs no fixture.
+GATE="$OUT/gate"
+rm -rf "$GATE"; mkdir -p "$GATE"
+IMGS=("$SCRIPT_DIR"/../../../public/i/*.jpg)  # a glob, not ls | head, which SIGPIPEs under pipefail
+IMG="${IMGS[0]}"
+BASE=(-c avm -d 10 --speed 6 --yuv 444 -a sb-size=128 -a qp=105 --jobs 8)
+"$AVIFENC" "${BASE[@]}" "$IMG" "$GATE/pristine.avif" >/dev/null
+"$TUNED/avifenc" "${BASE[@]}" "$IMG" "$GATE/tuned.avif" >/dev/null
+cmp -s "$GATE/pristine.avif" "$GATE/tuned.avif" || {
+  echo "error: the tuned build is not byte-identical with its options off" >&2; exit 1; }
+"$TUNED/avifenc" "${BASE[@]}" -a enable-qm=1 -a qm-curve=1 -a qmseg=1 -a qmseg-thresh=40 "$IMG" "$GATE/qmseg.avif" >/dev/null
+"$OUT/avifdec" "$GATE/qmseg.avif" "$GATE/qmseg.pristine.y4m" >/dev/null
+"$TUNED/avifdec" "$GATE/qmseg.avif" "$GATE/qmseg.tuned.y4m" >/dev/null
+cmp -s "$GATE/qmseg.pristine.y4m" "$GATE/qmseg.tuned.y4m" || {
+  echo "error: the reference decoder reads a qmseg file differently" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off, qmseg decodes identically)"

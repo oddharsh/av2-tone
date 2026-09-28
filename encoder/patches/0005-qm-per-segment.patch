@@ -1,0 +1,215 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-09-27 10:45:18
++++ b/av2/arg_defs.c	2026-09-27 13:56:13
+@@ -540,6 +540,18 @@
+   .qm_chroma_curve = ARG_DEF(NULL, "qm-chroma-curve", 1,
+                              "Chroma QM level curve: 0 as luma (default), "
+                              "1 libaom 4:4:4 chroma"),
++  .qmseg = ARG_DEF(NULL, "qmseg", 1,
++                   "Per-segment QM by texture (needs enable-qm=1): 0 off "
++                   "(default), 1 on"),
++  .qmseg_thresh = ARG_DEF(NULL, "qmseg-thresh", 1,
++                          "Pooled jpegli qf x100 below which a unit is "
++                          "textured (default 45)"),
++  .qmseg_level = ARG_DEF(NULL, "qmseg-level", 1,
++                         "Luma QM level for textured units, 0..15 "
++                         "(default 15, flat)"),
++  .qmseg_unit = ARG_DEF(NULL, "qmseg-unit", 1,
++                        "Classification unit in pixels: 16, 32, 64 or 128 "
++                        "(default 64)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-09-27 10:45:18
++++ b/av2/arg_defs.h	2026-09-27 13:56:13
+@@ -191,6 +191,10 @@
+   arg_def_t jm_dampen;
+   arg_def_t qm_curve;
+   arg_def_t qm_chroma_curve;
++  arg_def_t qmseg;
++  arg_def_t qmseg_thresh;
++  arg_def_t qmseg_level;
++  arg_def_t qmseg_unit;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-09-27 10:45:18
++++ b/av2/av2_cx_iface.c	2026-09-27 13:56:13
+@@ -257,6 +257,10 @@
+   int jm_dampen;
+   int qm_curve;
+   int qm_chroma_curve;
++  int qmseg;
++  int qmseg_thresh;
++  int qmseg_level;
++  int qmseg_unit;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -598,6 +602,10 @@
+   100,    // jm_dampen
+   0,      // qm_curve
+   0,      // qm_chroma_curve
++  0,      // qmseg
++  45,     // qmseg_thresh
++  15,     // qmseg_level
++  64,     // qmseg_unit
+ };
+ // clang-format on
+ 
+@@ -1497,6 +1505,13 @@
+   q_cfg->jm_dampen = clamp(extra_cfg->jm_dampen, 0, 100);
+   q_cfg->qm_curve = clamp(extra_cfg->qm_curve, 0, 2);
+   q_cfg->qm_chroma_curve = clamp(extra_cfg->qm_chroma_curve, 0, 1);
++  q_cfg->qmseg = clamp(extra_cfg->qmseg, 0, 1);
++  q_cfg->qmseg_thresh = clamp(extra_cfg->qmseg_thresh, 0, 1000);
++  q_cfg->qmseg_level = clamp(extra_cfg->qmseg_level, 0, NUM_QM_LEVELS - 1);
++  q_cfg->qmseg_unit = extra_cfg->qmseg_unit <= 16   ? 16
++                      : extra_cfg->qmseg_unit <= 32 ? 32
++                      : extra_cfg->qmseg_unit <= 64 ? 64
++                                                    : 128;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4119,6 +4134,18 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qm_chroma_curve,
+                                   argv, err_string)) {
+     extra_cfg.qm_chroma_curve = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg, argv,
++                                  err_string)) {
++    extra_cfg.qmseg = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg_thresh,
++                                  argv, err_string)) {
++    extra_cfg.qmseg_thresh = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg_level,
++                                  argv, err_string)) {
++    extra_cfg.qmseg_level = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg_unit,
++                                  argv, err_string)) {
++    extra_cfg.qmseg_unit = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/aq_variance.c	2026-09-27 10:34:17
++++ b/av2/encoder/aq_variance.c	2026-09-27 14:02:06
+@@ -13,6 +13,7 @@
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "avm_ports/mem.h"
+ 
+@@ -494,4 +495,64 @@
+     qindex_delta = -base_qindex + 1;
+   }
+   return base_qindex + qindex_delta;
++}
++
++// Per-segment QM (qmseg): classify each unit by the jpegli field, write the
++// segment map, and give the textured segment its own QM set. Runs after
++// av2_set_quantizer, which resets the frame to a single QM set, and leaves
++// segmentation alone when another tool already owns it.
++void av2_qmseg_frame_setup(AV2_COMP *cpi) {
++  AV2_COMMON *const cm = &cpi->common;
++  const QuantizationCfg *const q_cfg = &cpi->oxcf.q_cfg;
++  CommonQuantParams *const qp = &cm->quant_params;
++  struct segmentation *const seg = &cm->seg;
++  if (!q_cfg->qmseg || !qp->using_qmatrix || !frame_is_intra_only(cm) ||
++      seg->enabled)
++    return;
++  av2_jpegli_mask_frame(cpi);
++  if (!cpi->jm_qf) return;
++  const int mi_rows = cm->mi_params.mi_rows, mi_cols = cm->mi_params.mi_cols;
++  const int step = q_cfg->qmseg_unit / MI_SIZE;  // unit in mi
++  const int nb = q_cfg->qmseg_unit >> 3;         // unit in 8x8 field blocks
++  const float thr = q_cfg->qmseg_thresh / 100.0f;
++  int textured = 0, units = 0;
++  float qmin = 1e9f, qmax = 0, qsum = 0;
++  for (int ur = 0; ur < mi_rows; ur += step) {
++    for (int uc = 0; uc < mi_cols; uc += step) {
++      const float q = jm_pool(cpi, (uc * MI_SIZE) >> 3, (ur * MI_SIZE) >> 3,
++                              nb, nb);
++      qmin = AVMMIN(qmin, q);
++      qmax = AVMMAX(qmax, q);
++      qsum += q;
++      const uint8_t id = q < thr;
++      textured += id;
++      ++units;
++      for (int r = ur; r < AVMMIN(ur + step, mi_rows); ++r)
++        memset(cpi->enc_seg.map + r * mi_cols + uc, id,
++               AVMMIN(step, mi_cols - uc));
++    }
++  }
++  if (getenv("AVM_QMSEG_DEBUG"))
++    fprintf(stderr,
++            "qmseg: %d of %d units textured (thresh %.2f, pooled qf "
++            "min %.3f mean %.3f max %.3f)\n",
++            textured, units, thr, qmin, qsum / AVMMAX(units, 1), qmax);
++  // One class covers the frame: no map to signal. A fully textured frame
++  // takes the textured level frame-wide; a fully smooth one keeps its own.
++  if (textured == 0 || textured == units) {
++    memset(cpi->enc_seg.map, 0, (size_t)mi_rows * mi_cols);
++    if (textured == units) qp->qm_y[0] = q_cfg->qmseg_level;
++    return;
++  }
++  av2_enable_segmentation(seg);
++  av2_clearall_segfeatures(seg);
++  av2_set_segdata(seg, 1, SEG_LVL_ALT_Q, 0);
++  av2_enable_segfeature(seg, 1, SEG_LVL_ALT_Q);
++  qp->pic_qm_num = 2;
++  qp->qm_index_bits = 1;
++  qp->qm_y[1] = q_cfg->qmseg_level;
++  qp->qm_u[1] = qp->qm_u[0];
++  qp->qm_v[1] = qp->qm_v[0];
++  memset(qp->qm_index, 0, sizeof(qp->qm_index));
++  qp->qm_index[1] = 1;
+ }
+diff --avm
+--- a/av2/encoder/aq_variance.h	2026-09-27 10:19:39
++++ b/av2/encoder/aq_variance.h	2026-09-27 13:56:13
+@@ -30,6 +30,7 @@
+ int av2_get_sbq_variance_boost(const AV2_COMP *cpi, MACROBLOCK *x,
+                                BLOCK_SIZE sb_size);
+ void av2_jpegli_mask_frame(AV2_COMP *cpi);
++void av2_qmseg_frame_setup(AV2_COMP *cpi);
+ int av2_get_sbq_jpegli_mask(const AV2_COMP *cpi, int mi_row, int mi_col,
+                             BLOCK_SIZE sb_size);
+ int av2_compute_q_from_energy_level_deltaq_mode(const AV2_COMP *const cpi,
+diff --avm
+--- a/av2/encoder/encoder.c	2026-09-27 10:19:39
++++ b/av2/encoder/encoder.c	2026-09-27 13:56:13
+@@ -3503,6 +3503,7 @@
+     av2_cyclic_refresh_setup(cpi);
+     av2_apply_active_map(cpi);
+   }
++  av2_qmseg_frame_setup(cpi);
+   if (cm->seg.enabled) {
+     if (!cm->seg.update_data && cm->prev_frame) {
+       segfeatures_copy(&cm->seg, &cm->prev_frame->seg);
+@@ -3690,6 +3691,7 @@
+     } else if (q_cfg->aq_mode == COMPLEXITY_AQ) {
+       av2_setup_in_frame_q_adj(cpi);
+     }
++    av2_qmseg_frame_setup(cpi);
+ 
+     if (cm->seg.enabled) {
+       if (!cm->seg.update_data && cm->prev_frame) {
+diff --avm
+--- a/av2/encoder/encoder.h	2026-09-27 10:45:18
++++ b/av2/encoder/encoder.h	2026-09-27 13:56:13
+@@ -785,6 +785,11 @@
+   int qm_curve;
+   // Chroma QM level curve: 0 as luma, 1 libaom's 4:4:4 chroma curve.
+   int qm_chroma_curve;
++  // Per-segment QM: on/off, pooled-qf threshold x100, textured luma level, unit px.
++  int qmseg;
++  int qmseg_thresh;
++  int qmseg_level;
++  int qmseg_unit;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used

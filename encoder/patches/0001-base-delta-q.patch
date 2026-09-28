@@ -1,0 +1,125 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-09-27 09:37:35
++++ b/av2/arg_defs.c	2026-09-27 09:36:41
+@@ -511,6 +511,15 @@
+   .enable_chroma_deltaq = ARG_DEF(NULL, "enable-chroma-deltaq", 1,
+                                   "Enable chroma delta quant "
+                                   "(0: false (default), 1: true)"),
++  .base_y_dc_delta_q = ARG_DEF(NULL, "base-y-dc-delta-q", 1,
++                               "Sequence-level luma DC qindex offset, -23..8 "
++                               "(0 = off; negative quantizes DC more finely)"),
++  .base_uv_dc_delta_q = ARG_DEF(NULL, "base-uv-dc-delta-q", 1,
++                                "Sequence-level chroma DC qindex offset, "
++                                "-23..8 (0 = off)"),
++  .base_uv_ac_delta_q = ARG_DEF(NULL, "base-uv-ac-delta-q", 1,
++                                "Sequence-level chroma AC qindex offset, "
++                                "-23..8 (0 = off)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-09-27 09:37:35
++++ b/av2/arg_defs.h	2026-09-27 09:36:41
+@@ -179,6 +179,9 @@
+   arg_def_t min_partition_size;
+   arg_def_t max_partition_size;
+   arg_def_t enable_chroma_deltaq;
++  arg_def_t base_y_dc_delta_q;
++  arg_def_t base_uv_dc_delta_q;
++  arg_def_t base_uv_ac_delta_q;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-09-27 09:37:35
++++ b/av2/av2_cx_iface.c	2026-09-27 09:36:41
+@@ -245,6 +245,9 @@
+   int buffer_refresh_multi_layers_test[REF_FRAMES];
+   int multi_layers_lag_test;
+   int force_deferred_frames_for_ras_test;
++  int base_y_dc_delta_q;
++  int base_uv_dc_delta_q;
++  int base_uv_ac_delta_q;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -574,6 +577,9 @@
+   { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, // buffer_refresh_multi_layers_test
+   0,      // multi_layers_test for nozero lag
+   0,      // force_deferred_frames_for_ras_test
++  0,      // base_y_dc_delta_q
++  0,      // base_uv_dc_delta_q
++  0,      // base_uv_ac_delta_q
+ };
+ // clang-format on
+ 
+@@ -1461,6 +1467,9 @@
+   q_cfg->user_defined_qmatrix = extra_cfg->user_defined_qmatrix != 0;
+   q_cfg->quant_b_adapt = extra_cfg->quant_b_adapt;
+   q_cfg->enable_chroma_deltaq = extra_cfg->enable_chroma_deltaq;
++  q_cfg->base_y_dc_delta_q = extra_cfg->base_y_dc_delta_q;
++  q_cfg->base_uv_dc_delta_q = extra_cfg->base_uv_dc_delta_q;
++  q_cfg->base_uv_ac_delta_q = extra_cfg->base_uv_ac_delta_q;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4044,6 +4053,18 @@
+                                   argv, err_string)) {
+     extra_cfg.enable_chroma_deltaq =
+         avm_arg_parse_uint_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg,
++                                  &g_av2_codec_arg_defs.base_y_dc_delta_q,
++                                  argv, err_string)) {
++    extra_cfg.base_y_dc_delta_q = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg,
++                                  &g_av2_codec_arg_defs.base_uv_dc_delta_q,
++                                  argv, err_string)) {
++    extra_cfg.base_uv_dc_delta_q = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg,
++                                  &g_av2_codec_arg_defs.base_uv_ac_delta_q,
++                                  argv, err_string)) {
++    extra_cfg.base_uv_ac_delta_q = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/encoder.c	2026-09-27 09:37:35
++++ b/av2/encoder/encoder.c	2026-09-27 09:36:41
+@@ -657,6 +657,23 @@
+     seq->base_uv_dc_delta_q = 0;
+     seq->base_uv_ac_delta_q = 0;
+   }
++  {
++    // Encoder-side use of the sequence-level DC/chroma offsets, which the
++    // reference encoder always leaves at zero. Any non-zero value needs
++    // equal_ac_dc_q off so the offsets are signalled; each is clamped to the
++    // 5-bit syntax range.
++    const QuantizationCfg *const qc = &oxcf->q_cfg;
++    if (qc->base_y_dc_delta_q || qc->base_uv_dc_delta_q ||
++        qc->base_uv_ac_delta_q) {
++      seq->equal_ac_dc_q = 0;
++      seq->base_y_dc_delta_q = (int8_t)clamp(
++          qc->base_y_dc_delta_q, DELTA_DCQUANT_MIN, DELTA_DCQUANT_MAX);
++      seq->base_uv_dc_delta_q = (int8_t)clamp(
++          qc->base_uv_dc_delta_q, DELTA_DCQUANT_MIN, DELTA_DCQUANT_MAX);
++      seq->base_uv_ac_delta_q = (int8_t)clamp(
++          qc->base_uv_ac_delta_q, DELTA_DCQUANT_MIN, DELTA_DCQUANT_MAX);
++    }
++  }
+   assert(IMPLIES(seq->equal_ac_dc_q, seq->y_dc_delta_q_enabled == 0 &&
+                                          seq->base_y_dc_delta_q == 0));
+   assert(IMPLIES(seq->equal_ac_dc_q,
+diff --avm
+--- a/av2/encoder/encoder.h	2026-09-27 09:37:35
++++ b/av2/encoder/encoder.h	2026-09-27 09:36:41
+@@ -765,6 +765,10 @@
+   DELTAQ_MODE deltaq_mode;
+   // Indicates if delta quantization should be enabled in chroma planes.
+   bool enable_chroma_deltaq;
++  // Sequence-level DC / chroma qindex offsets, AV2 base_*_delta_q (-23..8).
++  int base_y_dc_delta_q;
++  int base_uv_dc_delta_q;
++  int base_uv_ac_delta_q;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used

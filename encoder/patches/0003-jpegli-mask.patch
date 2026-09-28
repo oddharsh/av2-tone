@@ -1,0 +1,400 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-09-27 09:48:40
++++ b/av2/arg_defs.c	2026-09-27 10:19:39
+@@ -526,6 +526,14 @@
+                        "Variance Boost octile of 8x8 variances, 1..8 (default 5)"),
+   .vb_max_boost = ARG_DEF(NULL, "vb-max-boost", 1,
+                           "Variance Boost cap in qindex steps (default 80)"),
++  .jm_strength = ARG_DEF(NULL, "jm-strength", 1,
++                         "jpegli mask strength in tenths, 0..40 (default 10)"),
++  .jm_octile = ARG_DEF(NULL, "jm-octile", 1,
++                       "jpegli mask superblock pooling octile, 1..8 (default 6)"),
++  .jm_max_delta = ARG_DEF(NULL, "jm-max-delta", 1,
++                          "jpegli mask max qindex delta either way (default 48)"),
++  .jm_dampen = ARG_DEF(NULL, "jm-dampen", 1,
++                       "jpegli mask modulation kept, 0..100 (default 100)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-09-27 09:48:40
++++ b/av2/arg_defs.h	2026-09-27 10:19:39
+@@ -185,6 +185,10 @@
+   arg_def_t vb_strength;
+   arg_def_t vb_octile;
+   arg_def_t vb_max_boost;
++  arg_def_t jm_strength;
++  arg_def_t jm_octile;
++  arg_def_t jm_max_delta;
++  arg_def_t jm_dampen;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-09-27 09:48:40
++++ b/av2/av2_cx_iface.c	2026-09-27 10:19:39
+@@ -251,6 +251,10 @@
+   int vb_strength;
+   int vb_octile;
+   int vb_max_boost;
++  int jm_strength;
++  int jm_octile;
++  int jm_max_delta;
++  int jm_dampen;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -586,6 +590,10 @@
+   30,     // vb_strength
+   5,      // vb_octile
+   80,     // vb_max_boost
++  10,     // jm_strength
++  6,      // jm_octile
++  48,     // jm_max_delta
++  100,    // jm_dampen
+ };
+ // clang-format on
+ 
+@@ -1479,6 +1487,10 @@
+   q_cfg->vb_strength = clamp(extra_cfg->vb_strength, 0, 60);
+   q_cfg->vb_octile = clamp(extra_cfg->vb_octile, 1, 8);
+   q_cfg->vb_max_boost = clamp(extra_cfg->vb_max_boost, 0, 200);
++  q_cfg->jm_strength = clamp(extra_cfg->jm_strength, 0, 40);
++  q_cfg->jm_octile = clamp(extra_cfg->jm_octile, 1, 8);
++  q_cfg->jm_max_delta = clamp(extra_cfg->jm_max_delta, 0, 200);
++  q_cfg->jm_dampen = clamp(extra_cfg->jm_dampen, 0, 100);
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4083,6 +4095,18 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.vb_max_boost,
+                                   argv, err_string)) {
+     extra_cfg.vb_max_boost = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.jm_strength,
++                                  argv, err_string)) {
++    extra_cfg.jm_strength = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.jm_octile,
++                                  argv, err_string)) {
++    extra_cfg.jm_octile = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.jm_max_delta,
++                                  argv, err_string)) {
++    extra_cfg.jm_max_delta = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.jm_dampen,
++                                  argv, err_string)) {
++    extra_cfg.jm_dampen = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/aq_variance.c	2026-09-27 09:48:40
++++ b/av2/encoder/aq_variance.c	2026-09-27 10:34:17
+@@ -11,6 +11,8 @@
+  */
+ 
+ #include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ #include "avm_ports/mem.h"
+ 
+@@ -195,6 +197,197 @@
+ }
+ 
+ #define DEFAULT_E_MIDPOINT 10.0
++
++/* ---- jpegli masking field (deltaq-mode=4) ------------------------------
++ * Scalar port of google/jpegli lib/jpegli/adaptive_quantization.cc @031a0077.
++ * Luma is taken on jpegli's 0..255 scale whatever the stream's bit depth. */
++#define JM_INPUT_SCALING (1.0f / 255.0f)
++
++// RatioOfDerivativesOfCubicRootToSimpleGamma: moves a difference from the
++// cube-root response into butteraugli's log-gamma space.
++static float jm_ratio(float v, int invert) {
++  const float kSGmul = 226.0480446705883f;
++  const float kSGmul2 = 1.0f / 73.377132366608819f;
++  const float kInvLog2e = 0.6931471805599453f;
++  const float kSGRetMul = kSGmul2 * 18.6580932135f * kInvLog2e;
++  const float kSGVOffset = 7.14672470003f;
++  const float kEpsilon = 1e-2f;
++  const float kNumOffset = kEpsilon / JM_INPUT_SCALING / JM_INPUT_SCALING;
++  const float kNumMul = kSGRetMul * 3 * kSGmul;
++  const float kVOffset = (kSGVOffset * kInvLog2e + kEpsilon) / JM_INPUT_SCALING;
++  const float kDenMul =
++      kInvLog2e * kSGmul * JM_INPUT_SCALING * JM_INPUT_SCALING;
++  if (v < 0) v = 0;
++  const float v2 = v * v;
++  const float num = kNumMul * v2 + kNumOffset;
++  const float den = kDenMul * v * v2 + kVOffset;
++  return invert ? num / den : den / num;
++}
++
++static float jm_masking_sqrt(float v) {
++  return 0.25f * sqrtf(v * sqrtf(211.50759899638012f * 1e8f) + 28.0f);
++}
++
++static float jm_compute_mask(float out) {
++  const float kBase = -0.74174993f, kMul4 = 3.2353257320940401f;
++  const float kMul2 = 12.906028311180409f, kOffset2 = 305.04035728311436f;
++  const float kMul3 = 5.0220313103171232f, kOffset3 = 2.1925739705298404f;
++  const float kOffset4 = 0.25f * kOffset3, kMul0 = 0.74760422233706747f;
++  const float v1 = AVMMAX(out * kMul0, 1e-3f);
++  const float v2 = 1.0f / (v1 + kOffset2);
++  const float v3 = 1.0f / (v1 * v1 + kOffset3);
++  const float v4 = 1.0f / (v1 * v1 + kOffset4);
++  return kBase + kMul4 * v4 + kMul2 * v2 + kMul3 * v3;
++}
++
++static int jm_cmp_float(const void *a, const void *b) {
++  const float x = *(const float *)a, y = *(const float *)b;
++  return (x > y) - (x < y);
++}
++
++// The superblock's qf: the octile-th value of its 8x8 blocks, ascending, so a
++// high octile follows the most precision-hungry blocks.
++static float jm_pool(const AV2_COMP *cpi, int bx0, int by0, int nbw, int nbh) {
++  float vals[1024];
++  int n = 0;
++  for (int by = by0; by < AVMMIN(by0 + nbh, cpi->jm_bh); ++by)
++    for (int bx = bx0; bx < AVMMIN(bx0 + nbw, cpi->jm_bw); ++bx)
++      if (n < 1024) vals[n++] = cpi->jm_qf[by * cpi->jm_bw + bx];
++  if (n == 0) return 1.0f;
++  qsort(vals, n, sizeof(vals[0]), jm_cmp_float);
++  return vals[clamp(cpi->oxcf.q_cfg.jm_octile * n / 8 - 1, 0, n - 1)];
++}
++
++void av2_jpegli_mask_frame(AV2_COMP *cpi) {
++  const AV2_COMMON *const cm = &cpi->common;
++  const QuantizationCfg *const q_cfg = &cpi->oxcf.q_cfg;
++  const YV12_BUFFER_CONFIG *const src = cpi->source;
++  const int w = src->y_crop_width, h = src->y_crop_height;
++  const int stride = src->y_stride;
++  const float scale = 255.0f / (float)((1 << cm->seq_params.bit_depth) - 1);
++  const int bw = (w + 7) >> 3, bh = (h + 7) >> 3;
++  const int W = bw * 8, H = bh * 8;  // padded to whole 8x8 blocks
++  const int pw = bw * 2, ph = bh * 2;  // the 4x4 pre-erosion grid
++  float *pix = avm_malloc(sizeof(*pix) * W * H);
++  float *pre = avm_malloc(sizeof(*pre) * pw * ph);
++  float *ero = avm_malloc(sizeof(*ero) * pw * ph);
++  if (!pix || !pre || !ero) goto done;
++  for (int y = 0; y < H; ++y)
++    for (int x = 0; x < W; ++x)
++      pix[y * W + x] =
++          scale * src->y_buffer[AVMMIN(y, h - 1) * stride + AVMMIN(x, w - 1)];
++#define JM_P(xx, yy) pix[clamp((yy), 0, H - 1) * W + clamp((xx), 0, W - 1)]
++  // ComputePreErosion: gamma-weighted Laplacian, clipped, MaskingSqrt, 4x4 pool
++  for (int py = 0; py < ph; ++py) {
++    for (int px = 0; px < pw; ++px) {
++      float sum = 0;
++      for (int dy = 0; dy < 4; ++dy) {
++        for (int dx = 0; dx < 4; ++dx) {
++          const int x = px * 4 + dx, y = py * 4 + dy;
++          const float in = JM_P(x, y);
++          const float base = 0.25f * (JM_P(x - 1, y) + JM_P(x + 1, y) +
++                                      JM_P(x, y - 1) + JM_P(x, y + 1));
++          const float g = jm_ratio(in + 0.019f * 255.0f, 0);
++          float d = g * (in - base);
++          d = AVMMIN(d * d, 0.2f);
++          sum += jm_masking_sqrt(d);
++        }
++      }
++      pre[py * pw + px] = 0.25f * sum;
++    }
++  }
++  // FuzzyErosion: weighted sum of the 4 smallest in each 3x3 neighbourhood
++  for (int py = 0; py < ph; ++py) {
++    for (int px = 0; px < pw; ++px) {
++      float m[4] = { 1e30f, 1e30f, 1e30f, 1e30f };
++      for (int dy = -1; dy <= 1; ++dy) {
++        for (int dx = -1; dx <= 1; ++dx) {
++          float v = pre[clamp(py + dy, 0, ph - 1) * pw + clamp(px + dx, 0, pw - 1)];
++          for (int k = 0; k < 4; ++k)
++            if (v < m[k]) { const float t = m[k]; m[k] = v; v = t; }
++        }
++      }
++      ero[py * pw + px] =
++          0.125f * m[0] + 0.075f * m[1] + 0.06f * m[2] + 0.05f * m[3];
++    }
++  }
++  if (!cpi->jm_qf || cpi->jm_bw != bw || cpi->jm_bh != bh) {
++    avm_free(cpi->jm_qf);
++    cpi->jm_qf = avm_malloc(sizeof(*cpi->jm_qf) * bw * bh);
++    cpi->jm_bw = bw;
++    cpi->jm_bh = bh;
++    if (!cpi->jm_qf) goto done;
++  }
++  // PerBlockModulations. jpegli dampens by its quant table's AC(1) entry; here
++  // that is jm-dampen, since an AV2 qindex has no JPEG quality to read off.
++  const float dampen = q_cfg->jm_dampen / 100.0f;
++  const float mul = 0.841f * dampen;
++  const float add = (1.0f - dampen) * 0.48f * 0.841f;
++  for (int by = 0; by < bh; ++by) {
++    for (int bx = 0; bx < bw; ++bx) {
++      const int e0 = (by * 2) * pw + bx * 2;
++      float out = jm_compute_mask(ero[e0] + ero[e0 + 1] + ero[e0 + pw] +
++                                  ero[e0 + pw + 1]);
++      float hf = 0, gr = 0;
++      for (int dy = 0; dy < 8; ++dy) {
++        for (int dx = 0; dx < 8; ++dx) {
++          const int x = bx * 8 + dx, y = by * 8 + dy;
++          const float p = JM_P(x, y);
++          if (dx < 7) hf += fabsf(p - JM_P(x + 1, y));
++          if (dy < 7) hf += fabsf(p - JM_P(x, y + 1));
++          gr += jm_ratio(p + 0.16f * 255.0f, 1);
++        }
++      }
++      out += hf * (-2.0052193233688884f * JM_INPUT_SCALING / 112.0f);
++      out += (-0.15526878023684174f * 0.6931471805599453f) *
++             log2f(gr * (JM_INPUT_SCALING / 64.0f));
++      cpi->jm_qf[by * bw + bx] = expf(out) * mul + add;
++    }
++  }
++#undef JM_P
++  {
++    // the frame reference: geometric mean of the pooled superblock values
++    const int sbpx = mi_size_wide[cm->sb_size] * MI_SIZE;
++    const int nb = AVMMAX(1, sbpx >> 3);
++    double acc = 0;
++    int n = 0;
++    for (int by = 0; by < bh; by += nb)
++      for (int bx = 0; bx < bw; bx += nb) {
++        acc += log(AVMMAX(jm_pool(cpi, bx, by, nb, nb), 1e-6f));
++        ++n;
++      }
++    cpi->jm_ref_log = n ? acc / n : 0.0;
++  }
++done:
++  avm_free(pix);
++  avm_free(pre);
++  avm_free(ero);
++}
++
++int av2_get_sbq_jpegli_mask(const AV2_COMP *cpi, int mi_row, int mi_col,
++                            BLOCK_SIZE sb_size) {
++  const AV2_COMMON *const cm = &cpi->common;
++  const QuantizationCfg *const q_cfg = &cpi->oxcf.q_cfg;
++  const int base_qindex = cm->quant_params.base_qindex;
++  if (base_qindex <= 0 || !cpi->jm_qf) return base_qindex;
++  const int nb = AVMMAX(1, (mi_size_wide[sb_size] * MI_SIZE) >> 3);
++  const float pooled = jm_pool(cpi, (mi_col * MI_SIZE) >> 3,
++                               (mi_row * MI_SIZE) >> 3, nb, nb);
++  const double ratio = exp((q_cfg->jm_strength / 10.0) *
++                           (log(AVMMAX(pooled, 1e-6f)) - cpi->jm_ref_log));
++  const avm_bit_depth_t bd = cm->seq_params.bit_depth;
++  const int qmax = (bd == AVM_BITS_8    ? QINDEX_RANGE_8_BITS
++                    : bd == AVM_BITS_10 ? QINDEX_RANGE_10_BITS
++                                        : QINDEX_RANGE) -
++                   1;
++  const double target_q = av2_convert_qindex_to_q(base_qindex, bd) / ratio;
++  int target = av2_find_qindex(target_q, bd, MINQ, qmax);
++  target = clamp(target, base_qindex - q_cfg->jm_max_delta,
++                 base_qindex + q_cfg->jm_max_delta);
++  if (getenv("AVM_JM_DEBUG"))
++    fprintf(stderr, "jm sb mi(%d,%d) pooled %.4f ref %.4f ratio %.3f base %d target %d\n", mi_row, mi_col, pooled, exp(cpi->jm_ref_log), ratio, base_qindex, target);
++  return AVMMAX(target, 1);
++}
+ 
+ static int vb_cmp_uint(const void *a, const void *b) {
+   const unsigned int x = *(const unsigned int *)a;
+diff --avm
+--- a/av2/encoder/aq_variance.h	2026-09-27 09:48:40
++++ b/av2/encoder/aq_variance.h	2026-09-27 10:19:39
+@@ -29,6 +29,9 @@
+ );
+ int av2_get_sbq_variance_boost(const AV2_COMP *cpi, MACROBLOCK *x,
+                                BLOCK_SIZE sb_size);
++void av2_jpegli_mask_frame(AV2_COMP *cpi);
++int av2_get_sbq_jpegli_mask(const AV2_COMP *cpi, int mi_row, int mi_col,
++                            BLOCK_SIZE sb_size);
+ int av2_compute_q_from_energy_level_deltaq_mode(const AV2_COMP *const cpi,
+                                                 int block_var_level);
+ int av2_block_wavelet_energy_level(const AV2_COMP *cpi, MACROBLOCK *x,
+diff --avm
+--- a/av2/encoder/encodeframe.c	2026-09-27 09:48:40
++++ b/av2/encoder/encodeframe.c	2026-09-27 10:19:39
+@@ -245,6 +245,8 @@
+     }
+   } else if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_VARIANCE_BOOST) {
+     current_qindex = av2_get_sbq_variance_boost(cpi, x, sb_size);
++  } else if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_JPEGLI_MASK) {
++    current_qindex = av2_get_sbq_jpegli_mask(cpi, mi_row, mi_col, sb_size);
+   } else if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_OBJECTIVE &&
+              cpi->oxcf.algo_cfg.enable_tpl_model) {
+     // Setup deltaq based on tpl stats
+@@ -255,7 +257,8 @@
+   const int delta_q_res = delta_q_info->delta_q_res;
+   // Right now aq only works with tpl model. So if tpl is disabled, we set the
+   // current_qindex to base_qindex.
+-  if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_VARIANCE_BOOST) {
++  if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_VARIANCE_BOOST ||
++      cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_JPEGLI_MASK) {
+     // the bit depth's real qindex range, where the path below clamps at 256
+     const avm_bit_depth_t bd = cm->seq_params.bit_depth;
+     const int qrange = bd == AVM_BITS_8    ? QINDEX_RANGE_8_BITS
+@@ -2185,7 +2188,8 @@
+     if (deltaq_mode == DELTA_Q_OBJECTIVE)
+       cm->delta_q_info.delta_q_res = DEFAULT_DELTA_Q_RES_OBJECTIVE;
+     else if (deltaq_mode == DELTA_Q_PERCEPTUAL ||
+-             deltaq_mode == DELTA_Q_VARIANCE_BOOST)
++             deltaq_mode == DELTA_Q_VARIANCE_BOOST ||
++             deltaq_mode == DELTA_Q_JPEGLI_MASK)
+       cm->delta_q_info.delta_q_res = DEFAULT_DELTA_Q_RES_PERCEPTUAL;
+     // Set delta_q_present_flag before it is used for the first time
+     cm->delta_q_info.delta_q_present_flag = deltaq_mode != NO_DELTA_Q;
+@@ -2209,6 +2213,9 @@
+     cm->delta_q_info.delta_q_present_flag &= quant_params->base_qindex > 0;
+   }
+ 
++  if (cpi->oxcf.q_cfg.deltaq_mode == DELTA_Q_JPEGLI_MASK &&
++      cm->delta_q_info.delta_q_present_flag)
++    av2_jpegli_mask_frame(cpi);
+   av2_frame_init_quantizer(cpi);
+   av2_initialize_rd_consts(cpi);
+   av2_set_sad_per_bit(cpi, &x->mv_costs, quant_params->base_qindex);
+diff --avm
+--- a/av2/encoder/encoder.c	2026-09-27 09:36:41
++++ b/av2/encoder/encoder.c	2026-09-27 10:19:39
+@@ -1857,6 +1857,8 @@
+ 
+ void av2_remove_compressor(AV2_COMP *cpi) {
+   if (!cpi) return;
++  avm_free(cpi->jm_qf);
++  cpi->jm_qf = NULL;
+ 
+   AV2_COMMON *cm = &cpi->common;
+   if (cm->current_frame.frame_number > 0) {
+diff --avm
+--- a/av2/encoder/encoder.h	2026-09-27 09:48:40
++++ b/av2/encoder/encoder.h	2026-09-27 10:19:39
+@@ -134,6 +134,7 @@
+   DELTA_Q_OBJECTIVE = 1,   // Modulation to improve objective quality
+   DELTA_Q_PERCEPTUAL = 2,  // Modulation to improve perceptual quality
+   DELTA_Q_VARIANCE_BOOST = 3,  // Finer q for flat superblocks (still images)
++  DELTA_Q_JPEGLI_MASK = 4,     // jpegli's masking field, both directions
+   DELTA_Q_MODE_COUNT       // This should always be the last member of the enum
+ } UENUM1BYTE(DELTAQ_MODE);
+ 
+@@ -774,6 +775,12 @@
+   int vb_strength;
+   int vb_octile;
+   int vb_max_boost;
++  // jpegli masking field (deltaq-mode=4): strength in tenths, pooling octile,
++  // max qindex delta either way, dampen 0..100 (jpegli's quality dampening).
++  int jm_strength;
++  int jm_octile;
++  int jm_max_delta;
++  int jm_dampen;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used
+@@ -3041,6 +3048,11 @@
+    * Flag indicating if banding metadata is available for the current frame
+    */
+   int band_metadata_present;
++  /*! jpegli masking field for the current frame, one value per 8x8 luma block */
++  float *jm_qf;
++  int jm_bw;
++  int jm_bh;
++  double jm_ref_log;
+ } AV2_COMP;
+ 
+ /*!
