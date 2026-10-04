@@ -17,7 +17,7 @@
 # behind <picture><source type="image/avif"> with a PNG <img> fallback draws a
 # BROKEN image (naturalWidth 0, currentSrc the AV2 source). The browser supports
 # the declared type, commits to it, and fails the decode, which <picture> does
-# not catch (CLAUDE.md gotcha 7). So these files cannot ship under the AVIF name.
+# not catch (docs/GOTCHAS.md gotcha 7). So these files cannot ship under the AVIF name.
 #
 # WHY A COMMIT AND NOT A TAG. No libavif release carries AVM v1.0.0, the first
 # released AV2 (2026-05-28). v1.4.2 pins AVM research-v15.0.0; v1.0.0 reached
