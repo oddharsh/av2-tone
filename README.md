@@ -1,0 +1,66 @@
+# av2-tone
+
+AV2 still images, encoded and decoded fast on a Mac, and checked bit for bit
+against AVM, the AV2 reference software. This code grew up inside
+[aadhar.sh](https://aadhar.sh/garage/av2) and moved here so it can stand on its own.
+
+AV2 is the successor to AV1. AVM 1.0.0 shipped in May 2026, and no browser
+decodes it yet. The image format is experimental: libavif's own build calls AV2
+support "only for testing", so every number below describes the pinned AVM and
+can move when the pin does.
+
+## What's here
+
+| dir | what it does |
+|---|---|
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: six encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
+| `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
+| `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
+
+Coming: a fast native decoder (NEON GDF and a parallel frame pass, 2.9x faster than
+AVM on one core) and a safe-Rust still-image decoder. The Rust decoder is the
+`av2-tone` crate this repo is named for, and it hasn't started yet.
+
+## Build
+
+You need macOS on Apple Silicon, `brew install cmake ninja pkgconf aom`, and
+[Bun](https://bun.sh). `wasm/` also needs `brew install emscripten`.
+
+```bash
+encoder/build.sh --tuned
+```
+
+That fetches libavif and AVM, builds the pristine encoder and decoder in
+`encoder/build/`, then the tuned pair in `encoder/build/tuned/`. It refuses to
+finish unless the tuned encoder, with every new option off, writes files
+byte-identical to the pristine one. The first run takes a few minutes.
+
+```bash
+metal/run.sh
+wasm/build.sh
+```
+
+`metal/run.sh` encodes the fixture at four quantizers, decodes them, and
+requires the GPU's GDF to match AVM's on every pixel for all 36 filter table
+sets. `wasm/build.sh` writes `wasm/build/av2dec.<sha8>.wasm`.
+
+## Numbers so far
+
+Measured on an M3 Max with other work running, so read them as approximate.
+
+- **Encoder, speed 3, one core, 600px tile:** 37.9 s pristine-with-SIMDe to
+  30.7 s with patch 0006. AVM cleared a 16 KB scratch buffer on every forward
+  transform, which was 20% of the encode.
+- **GDF on a 1600x2400 frame:** 211 ms in AVM's C on one core, 3.7 ms in NEON
+  across all cores, about 0.8 ms on the GPU.
+- **Measured and dropped:** `-mcpu=native` (no change) and more than four
+  encoder threads per tile (no faster).
+
+## Licence
+
+This repo's own files are BSD-2-Clause (see `LICENSE`). Nothing upstream is
+vendored. The build scripts fetch libavif (BSD-2-Clause), AVM
+(BSD-3-Clause-Clear plus the Alliance for Open Media Patent License 1.0) and
+SIMDe (MIT) at pinned commits. The patches in `encoder/patches/` modify AVM,
+so they carry AVM's terms.

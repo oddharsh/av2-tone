@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# build.sh: compile AVM's reference AV2 decoder to WebAssembly for /garage/av2.
+# build.sh: compile AVM's reference AV2 decoder to WebAssembly.
 #
-# WHAT IT WRITES. public/garage/av2/av2dec.<sha8>.wasm, named by the first 8 hex
-# of its own sha256 so the URL names exact bytes (the /pixel-peeper tile
-# convention), and removes any older av2dec.*.wasm beside it. Then update
-# WASM_URL in src/client/garage/av2-decode.js, which this script prints.
+# WHAT IT WRITES. build/av2dec.<sha8>.wasm, named by the first 8 hex of its own
+# sha256 so a URL can name exact bytes. With DEST=<dir> it also copies the file
+# there and removes any older av2dec.*.wasm beside it: aadhar.sh's /garage/av2
+# builds with DEST=<site>/public/garage/av2, then points WASM_URL in
+# src/client/garage/av2-decode.js at the new name.
 #
-# WHAT IT IS. The AVM 1.0.0 that ../libavif-avm/build.sh pins, built
+# WHAT IT IS. The AVM 1.0.0 that ../encoder/build.sh pins, built
 # decoder-only, single-threaded, no SIMD, as a standalone reactor module with
 # native WebAssembly longjmp (AVM reports errors by longjmp). That leaves five
-# imports, all stdio and memory plumbing, which av2-decode.js supplies by hand,
-# so no Emscripten JS glue ships. Native longjmp uses WebAssembly exception
-# handling in its legacy encoding (Emscripten's default): Chrome 95, Firefox
-# 100, Safari 15.2. av2dec.c is the small C surface the worker calls.
+# imports, all stdio and memory plumbing, which the host supplies by hand (the
+# site's av2-decode.js does), so no Emscripten JS glue ships. Native longjmp
+# uses WebAssembly exception handling in its legacy encoding (Emscripten's
+# default): Chrome 95, Firefox 100, Safari 15.2. av2dec.c is the small C
+# surface the worker calls.
 #
 # AVM's cmake re-enables CONFIG_TENSORFLOW_LITE for its encoder experiments and
 # prints a warning saying so, but with the encoder off no TFLite object reaches
@@ -23,8 +25,8 @@
 # speeds 2, 6, 9). RGBA matches avifdec's FULL-DEPTH decode rounded to 8 bits
 # on 100.00% of samples (max delta 1); against avifdec -d 8 it reads up to 3
 # off, because that build's libyuv 8-bit path is the coarse one.
-# contract-av2-decoder-matches-avm.test.mjs holds the shipped samples to the
-# plane hashes native AVM produced (expected.json, written by expect.ts).
+# On aadhar.sh, contract-av2-decoder-matches-avm.test.mjs holds the shipped
+# samples to the plane hashes native AVM produced.
 #
 # COST. 1,760,696 B. Brotli q11 gets it to about 430 KB, but it ships with no
 # precompressed twin, so the edge compresses it on the fly: measured on a branch
@@ -34,18 +36,18 @@
 # faster, so it stays off.
 #
 #   ./build.sh            needs emcc (brew install emscripten) and the AVM
-#                         source from ../libavif-avm/build.sh, or AVM_SRC=<dir>
+#                         source from ../encoder/build.sh, or AVM_SRC=<dir>
+#   DEST=<dir> ./build.sh also copy the wasm into <dir>
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO="$(cd "$HERE/../../.." && pwd)"
-AVM_SRC="${AVM_SRC:-$HERE/../libavif-avm/build/_deps/libavm-src}"
+AVM_SRC="${AVM_SRC:-$HERE/../encoder/build/_deps/libavm-src}"
 OUT="$HERE/build"
-DEST="$REPO/public/garage/av2"
+DEST="${DEST:-}"
 
 command -v emcc >/dev/null || { echo "error: emcc not found (brew install emscripten)" >&2; exit 1; }
 [ -f "$AVM_SRC/av2/av2_dx_iface.c" ] || {
-  echo "error: no AVM source at $AVM_SRC; run ../libavif-avm/build.sh or set AVM_SRC" >&2; exit 1; }
+  echo "error: no AVM source at $AVM_SRC; run ../encoder/build.sh or set AVM_SRC" >&2; exit 1; }
 grep -q 'v1.0.0' "$AVM_SRC/CHANGELOG" 2>/dev/null || echo "warning: $AVM_SRC may not be AVM v1.0.0" >&2
 
 SJLJ="-sSUPPORT_LONGJMP=wasm"
@@ -63,7 +65,11 @@ emcc -O3 "$SJLJ" "$HERE/av2dec.c" "$OUT/avm/libavm.a" -I"$AVM_SRC" -I"$OUT/avm" 
   -sEXPORTED_FUNCTIONS="$EXPORTS" -o "$OUT/av2dec.wasm" 2> >(grep -v 'warning' >&2 || true)
 
 hash="$(shasum -a 256 "$OUT/av2dec.wasm" | cut -c1-8)"
-rm -f "$DEST"/av2dec.*.wasm
-cp "$OUT/av2dec.wasm" "$DEST/av2dec.$hash.wasm"
-echo "wrote public/garage/av2/av2dec.$hash.wasm ($(stat -f %z "$OUT/av2dec.wasm") B)"
-echo "set WASM_URL in src/client/garage/av2-decode.js to /garage/av2/av2dec.$hash.wasm"
+rm -f "$OUT"/av2dec.*.wasm
+cp "$OUT/av2dec.wasm" "$OUT/av2dec.$hash.wasm"
+echo "wrote build/av2dec.$hash.wasm ($(stat -f %z "$OUT/av2dec.wasm") B)"
+if [ -n "$DEST" ]; then
+  rm -f "$DEST"/av2dec.*.wasm
+  cp "$OUT/av2dec.wasm" "$DEST/av2dec.$hash.wasm"
+  echo "copied to $DEST/av2dec.$hash.wasm"
+fi

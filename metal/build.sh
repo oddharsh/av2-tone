@@ -8,7 +8,7 @@
 # entropy parse is not, so a GPU can only ever take GDF's share.
 #
 # THE ORACLE is gdf_block.c compiled straight from the pinned AVM source that
-# tools/photos/libavif-avm/build.sh fetched, so the reference kernels and the
+# ../encoder/build.sh fetched, so the reference kernels and the
 # tables are the decoder's own, never a copy.
 #
 # The shader compiles at run time through newLibraryWithSource, so this needs
@@ -19,15 +19,15 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-AVM_BUILD="${AVM_BUILD:-$DIR/../libavif-avm/build}"
+AVM_BUILD="${AVM_BUILD:-$DIR/../encoder/build}"
 AVM_SRC="$AVM_BUILD/_deps/libavm-src"
 AVM_CFG="$AVM_BUILD/_deps/libavm-build"
 OUT="$DIR/build"
 
 [ -f "$AVM_SRC/av2/common/gdf_block.c" ] || {
-  echo "error: $AVM_SRC has no AVM source; run tools/photos/libavif-avm/build.sh first" >&2; exit 1; }
+  echo "error: $AVM_SRC has no AVM source; run ../encoder/build.sh first" >&2; exit 1; }
 [ -f "$AVM_CFG/config/avm_config.h" ] || {
-  echo "error: $AVM_CFG/config/avm_config.h missing; run tools/photos/libavif-avm/build.sh first" >&2; exit 1; }
+  echo "error: $AVM_CFG/config/avm_config.h missing; run ../encoder/build.sh first" >&2; exit 1; }
 
 mkdir -p "$OUT"
 # -fwrapv: the C oracle relies on int32 wrap where GDF_NORM_IDX scales a large

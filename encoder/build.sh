@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# build.sh — build an AV2-capable avifenc/avifdec from PINNED SOURCE.
+# build.sh: build an AV2-capable avifenc/avifdec from PINNED SOURCE.
 #
-# WHAT THIS IS FOR. Measurement, never serving as an image. No browser decodes
-# AV2, and the file format is experimental, so nothing this build writes may
-# reach an <img> or a <picture>. Two kinds of file do reach public/, as DATA for
-# the AVM WebAssembly decoder those pages run: /garage/av2's samples
-# (av2-wasm/samples.ts) and /pixel-peeper's AV2 tiles (gen-pixel-peeper.ts,
-# whose labels contract-pixel-peeper-av2-tiles-are-av02 checks). The probes,
-# codec-knob-probe.ts `--codec avm` and av2-tile-probe.ts, encode AV2 stills
-# onto the /pixel-peeper format axis's own AVIF budgets and score them at
-# matched bytes, which is how to watch where AV2 is going for photos.
+# WHAT THIS IS FOR. Measurement and test files, never serving as an image. No
+# browser decodes AV2, and the file format is experimental. aadhar.sh uses
+# these binaries to encode AV2 stills onto its own AVIF byte budgets and score
+# them at matched bytes (its av2-tile-probe.ts and codec-knob-probe.ts), and the
+# few AV2 files it publishes reach the page only as DATA for the WebAssembly
+# decoder that ../wasm builds.
 #
 # WHAT IT PRODUCES. libavif built with its experimental AVIF_CODEC_AVM (AVM is
 # the AV2 reference software from AOMedia) plus the installed aom, so ONE
@@ -41,7 +38,7 @@
 #
 # COST. The first build fetches AVM plus its TensorFlow Lite, abseil, eigen and
 # libyuv trees and takes about 2 minutes on 14 cores. Everything lands under
-# src/ and build/, both gitignored, same as the sibling libavif/ build.
+# src/ and build/, both gitignored.
 #
 #   ./build.sh            build if missing
 #   ./build.sh --force    rebuild from scratch
@@ -167,11 +164,13 @@ cmake -G Ninja -S "$SRC" -B "$TUNED" \
 cmake --build "$TUNED" --target avifenc avifdec >&2
 bun "$SCRIPT_DIR/simde.ts" --src "$TSRC" --build "$TUNED" --simde "$SIMDE_DIR" --work "$OUT/simde-work" >&2
 
-# THE GATE. A committed 600px tier is the input, so it needs no fixture.
+# THE GATE. Its input is ../fixture's synthetic frame (gradients, noise, edges,
+# stripes), deterministic and licence-free. AV2_GATE_IMAGE=<file> swaps in a
+# real photo; aadhar.sh passes one of its own 600px tiers.
 GATE="$OUT/gate"
 rm -rf "$GATE"; mkdir -p "$GATE"
-IMGS=("$SCRIPT_DIR"/../../../public/i/*.jpg)  # a glob, not ls | head, which SIGPIPEs under pipefail
-IMG="${IMGS[0]}"
+IMG="${AV2_GATE_IMAGE:-$(bun "$SCRIPT_DIR/../fixture/gen.ts")}"
+[ -f "$IMG" ] || { echo "error: gate image $IMG not found" >&2; exit 1; }
 BASE=(-c avm -d 10 --speed 6 --yuv 444 -a sb-size=128 -a qp=105 --jobs 8)
 "$AVIFENC" "${BASE[@]}" "$IMG" "$GATE/pristine.avif" >/dev/null
 "$TUNED/avifenc" "${BASE[@]}" "$IMG" "$GATE/tuned.avif" >/dev/null
