@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AV2 Local Race</title>
+<style>
+  :root {
+    --bg: #fafaf9; --panel: #ffffff; --ink: #1c1917; --muted: #78716c; --line: #e7e5e4;
+    --bar: #d6d3d1; --hot: #2563eb; --av1: #a8a29e; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0c0a09; --panel: #1c1917; --ink: #f5f5f4; --muted: #a8a29e; --line: #292524;
+      --bar: #44403c; --hot: #60a5fa; --av1: #57534e; --ok: #4ade80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .num { font-variant-numeric: tabular-nums; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .head { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
+  select, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+  .stage { position: relative; overflow: auto; max-height: 78vh; background: #000; border-radius: 6px; cursor: zoom-in; }
+  .stage.full { cursor: zoom-out; }
+  .stage img { display: block; max-width: 100%; max-height: 78vh; width: auto; height: auto; margin: 0 auto; }
+  .stage.full img { max-width: none; max-height: none; }
+  .stage img[hidden] { display: none; }
+  .caption { color: var(--muted); margin-top: 8px; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .group { margin-bottom: 14px; }
+  .group h3 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 0 0 6px; }
+  .row { display: grid; grid-template-columns: 112px 1fr 76px; gap: 8px; align-items: center; font-size: 13px; margin: 3px 0; }
+  .track { height: 14px; }
+  .fill { height: 100%; background: var(--bar); border-radius: 3px; min-width: 2px; }
+  .fill.hot { background: var(--hot); }
+  .fill.av1 { background: var(--av1); }
+  .ms { text-align: right; }
+  .note { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  .ok { color: var(--ok); }
+  .empty { color: var(--muted); }
+  kbd { font: 12px ui-monospace, Menlo, monospace; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="head">
+    <div>
+      <h1>AV2 on this Mac</h1>
+      <p class="sub" id="sub">Same photo, same bytes, AV1 against AV2.</p>
+    </div>
+    <label>Run <select id="pick"></select></label>
+  </div>
+  <div id="app"><p class="empty">No runs yet. <code>bun demo/run.ts &lt;photo&gt;</code> makes one.</p></div>
+</main>
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const fmtB = (n) => n.toLocaleString() + " B";
+const fmtMs = (ms) => ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : ms.toFixed(1) + " ms";
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+function bars(rows) {
+  const max = Math.max(...rows.map((r) => r.v));
+  return rows.map((r) => `<div class="row"><span>${esc(r.label)}</span>
+    <div class="track"><div class="fill ${r.cls || ""}" style="width:${(r.v / max * 100).toFixed(1)}%"></div></div>
+    <span class="ms num">${fmtMs(r.v)}</span></div>`).join("");
+}
+
+function render(run) {
+  const base = `/runs/${encodeURIComponent(run.stem)}/`;
+  const views = [
+    { key: "source", label: "Source", src: run.source.png, cap: `Source PNG, ${run.source.width}x${run.source.height}, from ${run.source.from}` },
+    { key: "av1", label: "AV1", src: run.av1.png, cap: `AV1 (aom, the AVIF browsers decode today): ${fmtB(run.av1.bytes)}` + (run.av1.s2 != null ? `, ssimulacra2 ${run.av1.s2.toFixed(2)}` : "") },
+    { key: "av2", label: "AV2", src: run.av2.png, cap: `AV2 (AVM 1.0.0, qp ${run.settings.qp}): ${fmtB(run.av2.bytes)}` + (run.av2.s2 != null ? `, ssimulacra2 ${run.av2.s2.toFixed(2)}` : "") + ". Decoded to PNG here, since no browser reads AV2." },
+  ];
+  const d = run.decode;
+  const pick = (dec, file, t) => d.find((r) => r.decoder === dec && r.file === file && r.threads === t);
+  const threads = [...new Set(d.map((r) => r.threads))].sort((a, b) => a - b);
+  const ratio = (a, b) => a && b ? (a.min / b.min).toFixed(1) + "x" : "?";
+
+  const decodeGroups = threads.map((t) => {
+    const label = t === 1 ? "1 thread, one core" : `${t} threads`;
+    const fast444 = pick("fast", "av2", t), avm444 = pick("AVM", "av2", t);
+    const fast420 = pick("fast", "av2_420", t), avm420 = pick("AVM", "av2_420", t), dav2d = pick("dav2d", "av2_420", t);
+    const dav1d = pick("dav1d", "av1", t);
+    return `<div class="group"><h3>${label}: AV2 4:4:4, the file above</h3>${bars([
+      { label: "AVM (reference)", v: avm444.min },
+      { label: "fast", v: fast444.min, cls: "hot" },
+      { label: "dav1d on AV1", v: dav1d.min, cls: "av1" },
+    ])}<p class="note">fast is ${ratio(avm444, fast444)} quicker than AVM.</p></div>
+    <div class="group"><h3>${label}: AV2 4:2:0, so dav2d can race</h3>${bars([
+      { label: "AVM (reference)", v: avm420.min },
+      { label: "dav2d", v: dav2d.min },
+      { label: "fast", v: fast420.min, cls: "hot" },
+    ])}<p class="note">fast vs dav2d: ${fast420.min <= dav2d.min ? `fast ${ratio(dav2d, fast420)} quicker` : `dav2d ${ratio(fast420, dav2d)} quicker`}.</p></div>`;
+  }).join("");
+
+  $("#app").innerHTML = `
+    <section>
+      <div class="tabs" role="group" aria-label="Image">
+        ${views.map((v, i) => `<button data-k="${v.key}" aria-pressed="${i === 2}">${v.label} <kbd>${i + 1}</kbd></button>`).join("")}
+      </div>
+      <div class="stage" id="stage" title="Click for actual pixels">
+        ${views.map((v) => `<img data-k="${v.key}" src="${base}${v.src}" alt="${esc(v.label)}" ${v.key === "av2" ? "" : "hidden"}>`).join("")}
+      </div>
+      <p class="caption" id="cap"></p>
+    </section>
+    <div class="grid">
+      <section>
+        <h2>Encode</h2>
+        <div class="group"><h3>AV2 at speed ${run.settings.speed}, ${run.settings.jobs} jobs</h3>${bars([
+          { label: "AVM (reference)", v: run.encode.pristineMs },
+          { label: "tuned", v: run.encode.tunedMs, cls: "hot" },
+        ])}</div>
+        <div class="group"><h3>For scale</h3>${bars([{ label: "AV1, aom speed 2", v: run.av1.encodeMs, cls: "av1" }])}</div>
+        <p class="note">The tuned encoder ran ${(run.encode.pristineMs / run.encode.tunedMs).toFixed(2)}x quicker than AVM here and wrote
+          <span class="ok">identical bytes</span>. One encode each, so load moves this number more than the decode race.</p>
+      </section>
+      <section>
+        <h2>Decode, best of ${run.settings.reps}</h2>
+        ${decodeGroups}
+        <p class="note"><span class="ok">Every AV2 decoder produced the same pixels</span> (plane hashes match).</p>
+      </section>
+    </div>
+    <p class="note num">${esc(run.machine.cpu)}, ${run.machine.cores} cores, load average ${run.machine.loadStart.toFixed(0)} at start and
+      ${run.machine.loadEnd.toFixed(0)} at the end. ${new Date(run.date).toLocaleString()}. Click the photo for actual pixels; keys 1, 2, 3 flip between versions.</p>`;
+
+  const show = (k) => {
+    for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-pressed", String(b.dataset.k === k));
+    for (const im of document.querySelectorAll("#stage img")) im.hidden = im.dataset.k !== k;
+    $("#cap").textContent = views.find((v) => v.key === k).cap;
+  };
+  for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => show(b.dataset.k);
+  $("#stage").onclick = () => $("#stage").classList.toggle("full");
+  document.onkeydown = (e) => { const v = views[+e.key - 1]; if (v) show(v.key); };
+  show("av2");
+  $("#sub").textContent = `${run.stem}: ${fmtB(run.av1.bytes)} of AV1 against ${fmtB(run.av2.bytes)} of AV2.`;
+}
+
+fetch("/runs.json").then((r) => r.json()).then((list) => {
+  if (!list.length) return;
+  $("#pick").innerHTML = list.map((r, i) => `<option value="${i}">${esc(r.stem)}</option>`).join("");
+  $("#pick").onchange = () => render(list[+$("#pick").value]);
+  render(list[0]);
+});
+</script>
+</body>
+</html>

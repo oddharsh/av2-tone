@@ -17,6 +17,7 @@ can move when the pin does.
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
 | `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
+| `demo/` | encodes your photo as AV1 and AV2 at the same byte count, races the encoders and the decoders (AVM, the fast decoder, dav2d, dav1d) on it, and shows both images on a local page |
 
 Coming: a fast native decoder (NEON GDF and a parallel frame pass, 2.9x faster than
 AVM on one core) and a safe-Rust still-image decoder. The Rust decoder is the
