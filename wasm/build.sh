@@ -35,6 +35,11 @@
 # preview, 39 to 92 ms. -msimd128 auto-vectorization measured no
 # faster, so it stays off.
 #
+# EMSCRIPTEN DECIDES THE BYTES. emcc 6.0.12 minted av2dec.90fc76df.wasm, the
+# file aadhar.sh serves (rebuilt byte-identical from a clean av2-tone checkout,
+# 2026-10-14). Another emcc can write different bytes and so a new name, which
+# re-mints the URL and needs the site's contract re-run; the build warns.
+#
 #   ./build.sh            needs emcc (brew install emscripten) and the AVM
 #                         source from ../encoder/build.sh, or AVM_SRC=<dir>
 #   DEST=<dir> ./build.sh also copy the wasm into <dir>
@@ -46,6 +51,9 @@ OUT="$HERE/build"
 DEST="${DEST:-}"
 
 command -v emcc >/dev/null || { echo "error: emcc not found (brew install emscripten)" >&2; exit 1; }
+EMCC_PINNED="6.0.12"
+emcc_version="$(emcc --version | sed -n '1s/.*) \([0-9][0-9.]*\).*/\1/p')"
+[ "$emcc_version" = "$EMCC_PINNED" ] || echo "warning: emcc $emcc_version, not $EMCC_PINNED; the wasm may differ from the shipped one" >&2
 [ -f "$AVM_SRC/av2/av2_dx_iface.c" ] || {
   echo "error: no AVM source at $AVM_SRC; run ../encoder/build.sh or set AVM_SRC" >&2; exit 1; }
 grep -q 'v1.0.0' "$AVM_SRC/CHANGELOG" 2>/dev/null || echo "warning: $AVM_SRC may not be AVM v1.0.0" >&2
