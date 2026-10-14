@@ -1,0 +1,8 @@
+{
+  "name": "av2-tone",
+  "version": "0.0.0",
+  "private": true,
+  "description": "AV2 still images on Apple Silicon: a tuned AVM encoder, a WebAssembly decoder, and GDF on Metal, bit-exact against AVM",
+  "license": "BSD-2-Clause",
+  "repository": "github:oddharsh/av2-tone"
+}
