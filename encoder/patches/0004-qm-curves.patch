@@ -1,0 +1,166 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-09-27 10:19:39
++++ b/av2/arg_defs.c	2026-09-27 10:45:18
+@@ -534,6 +534,12 @@
+                           "jpegli mask max qindex delta either way (default 48)"),
+   .jm_dampen = ARG_DEF(NULL, "jm-dampen", 1,
+                        "jpegli mask modulation kept, 0..100 (default 100)"),
++  .qm_curve = ARG_DEF(NULL, "qm-curve", 1,
++                      "QM level curve: 0 linear (default), 1 all-intra, "
++                      "2 ssimulacra2 (libaom)"),
++  .qm_chroma_curve = ARG_DEF(NULL, "qm-chroma-curve", 1,
++                             "Chroma QM level curve: 0 as luma (default), "
++                             "1 libaom 4:4:4 chroma"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-09-27 10:19:39
++++ b/av2/arg_defs.h	2026-09-27 10:45:18
+@@ -189,6 +189,8 @@
+   arg_def_t jm_octile;
+   arg_def_t jm_max_delta;
+   arg_def_t jm_dampen;
++  arg_def_t qm_curve;
++  arg_def_t qm_chroma_curve;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-09-27 10:19:39
++++ b/av2/av2_cx_iface.c	2026-09-27 10:45:18
+@@ -255,6 +255,8 @@
+   int jm_octile;
+   int jm_max_delta;
+   int jm_dampen;
++  int qm_curve;
++  int qm_chroma_curve;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -594,6 +596,8 @@
+   6,      // jm_octile
+   48,     // jm_max_delta
+   100,    // jm_dampen
++  0,      // qm_curve
++  0,      // qm_chroma_curve
+ };
+ // clang-format on
+ 
+@@ -1491,6 +1495,8 @@
+   q_cfg->jm_octile = clamp(extra_cfg->jm_octile, 1, 8);
+   q_cfg->jm_max_delta = clamp(extra_cfg->jm_max_delta, 0, 200);
+   q_cfg->jm_dampen = clamp(extra_cfg->jm_dampen, 0, 100);
++  q_cfg->qm_curve = clamp(extra_cfg->qm_curve, 0, 2);
++  q_cfg->qm_chroma_curve = clamp(extra_cfg->qm_chroma_curve, 0, 1);
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4107,6 +4113,12 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.jm_dampen,
+                                   argv, err_string)) {
+     extra_cfg.jm_dampen = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qm_curve,
++                                  argv, err_string)) {
++    extra_cfg.qm_curve = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qm_chroma_curve,
++                                  argv, err_string)) {
++    extra_cfg.qm_chroma_curve = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/av2_quantize.c	2026-09-27 00:29:57
++++ b/av2/encoder/av2_quantize.c	2026-09-27 10:45:18
+@@ -596,6 +596,38 @@
+   }
+ }
+ 
++// libaom's still-image QM curves, thresholds moved to AV2's 10-bit qindex by
++// matching AC step size (AV1 qindex in the comment). Decreasing in qindex:
++// a finer quantizer gets a flatter matrix.
++static int qm_q10(int qindex, avm_bit_depth_t bd) {
++  // the same step sits 48 qindex higher per two bits of depth
++  return bd == AVM_BITS_8 ? qindex + 2 * MAXQ_OFFSET
++         : bd == AVM_BITS_10 ? qindex
++                             : qindex - 2 * MAXQ_OFFSET;
++}
++static int qm_curve_level(int q10, const int *thr, int n, int top) {
++  int level = top;
++  for (int i = 0; i < n && q10 > thr[i]; i++) level--;
++  return level;
++}
++// aom_get_qmlevel_allintra: av1 40 100 160 200 220 240, levels 10..4
++static const int qm_thr_allintra[] = { 121, 156, 191, 217, 230, 243 };
++// aom_get_qmlevel_luma_ssimulacra2: av1 40 60 90 120 130 140 160 200, 10..2
++static const int qm_thr_luma_s2[] = { 121, 136, 150, 167, 173, 179, 191, 217 };
++// aom_get_qmlevel_444_chroma: av1 12 24 32 36 44 48 56 88, levels 10..2
++static const int qm_thr_chroma444[] = { 73, 100, 112, 116, 124, 128, 133, 150 };
++
++static int qm_level_for(int qindex, int curve, int min_qmlevel,
++                        int max_qmlevel, avm_bit_depth_t bd) {
++  const int q10 = qm_q10(qindex, bd);
++  switch (curve) {
++    case 1: return qm_curve_level(q10, qm_thr_allintra, 6, 10);
++    case 2: return qm_curve_level(q10, qm_thr_luma_s2, 8, 10);
++    case 3: return qm_curve_level(q10, qm_thr_chroma444, 8, 10);
++    default: return avm_get_qmlevel(qindex, min_qmlevel, max_qmlevel, bd);
++  }
++}
++
+ // Sets qm_y[i], qm_u[i], and qm_v[i] in quant_params.
+ // Note: This function is not fully implemented if quant_params->pic_qm_num > 1.
+ // In that case, this function simply sets qm_y[i] to the same value for all i.
+@@ -603,18 +635,21 @@
+ // TODO(wtc): No need to set qm_u[i], and qm_v[i] if monochrome.
+ static void set_qm_params(AV2_COMMON *const cm,
+                           CommonQuantParams *const quant_params,
+-                          int min_qmlevel, int max_qmlevel) {
+-  int qm_y = avm_get_qmlevel(quant_params->base_qindex, min_qmlevel,
+-                             max_qmlevel, cm->seq_params.bit_depth);
++                          int min_qmlevel, int max_qmlevel, int curve,
++                          int chroma_curve) {
++  const avm_bit_depth_t bd = cm->seq_params.bit_depth;
++  const int uv_curve = chroma_curve ? 3 : curve;
++  int qm_y = qm_level_for(quant_params->base_qindex, curve, min_qmlevel,
++                          max_qmlevel, bd);
+   int qm_u =
+-      avm_get_qmlevel(quant_params->base_qindex + quant_params->u_ac_delta_q,
+-                      min_qmlevel, max_qmlevel, cm->seq_params.bit_depth);
++      qm_level_for(quant_params->base_qindex + quant_params->u_ac_delta_q,
++                   uv_curve, min_qmlevel, max_qmlevel, bd);
+ 
+   int qm_v = qm_u;
+   if (cm->seq_params.separate_uv_delta_q) {
+     qm_v =
+-        avm_get_qmlevel(quant_params->base_qindex + quant_params->v_ac_delta_q,
+-                        min_qmlevel, max_qmlevel, cm->seq_params.bit_depth);
++        qm_level_for(quant_params->base_qindex + quant_params->v_ac_delta_q,
++                     uv_curve, min_qmlevel, max_qmlevel, bd);
+   }
+ 
+   quant_params->pic_qm_num = 1;
+@@ -643,7 +678,8 @@
+   cm->cur_frame->u_ac_delta_q = quant_params->u_ac_delta_q;
+   cm->cur_frame->v_ac_delta_q = quant_params->v_ac_delta_q;
+   if (cpi->oxcf.unit_test_cfg.frame_multi_qmatrix_unit_test == 0) {
+-    set_qm_params(cm, quant_params, min_qmlevel, max_qmlevel);
++    set_qm_params(cm, quant_params, min_qmlevel, max_qmlevel,
++                  cpi->oxcf.q_cfg.qm_curve, cpi->oxcf.q_cfg.qm_chroma_curve);
+   } else {
+     set_qm_test_params(cm, quant_params, min_qmlevel, max_qmlevel,
+                        cpi->oxcf.unit_test_cfg.frame_multi_qmatrix_unit_test);
+diff --avm
+--- a/av2/encoder/encoder.h	2026-09-27 10:19:39
++++ b/av2/encoder/encoder.h	2026-09-27 10:45:18
+@@ -781,6 +781,10 @@
+   int jm_octile;
+   int jm_max_delta;
+   int jm_dampen;
++  // QM level curves: 0 linear (AVM), 1 all-intra, 2 SSIMULACRA 2 (libaom).
++  int qm_curve;
++  // Chroma QM level curve: 0 as luma, 1 libaom's 4:4:4 chroma curve.
++  int qm_chroma_curve;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used
