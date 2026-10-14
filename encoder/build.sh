@@ -48,13 +48,16 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds five encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds six encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
 #   0003 jpegli-mask     deltaq-mode=4, jpegli adaptive-quantization field
 #   0004 qm-curves       qm-curve / qm-chroma-curve, libaom still-image QM levels
 #   0005 qm-per-segment  qmseg: two QM sets split by texture, an AV2-only syntax
+#   0006 fwd-txfm        speed only, no option: the forward transform zeroed a
+#                        16 KB scratch per call, 20% of a speed-3 encode (1 core,
+#                        600px: 37.9 s to 30.7 s; speed 6 about 5%)
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a

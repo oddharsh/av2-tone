@@ -1,0 +1,41 @@
+diff --avm
+Performance only: the forward transform clears the scratch it uses, not 16 KB.
+Output is byte-identical (build.sh --tuned gates it).
+--- a/av2/encoder/hybrid_fwd_txfm.c	2026-10-14 13:03:31
++++ b/av2/encoder/hybrid_fwd_txfm.c	2026-10-14 13:03:31
+@@ -984,7 +984,11 @@
+   int skipWidth = width > 32 ? width - 32 : 0;
+   int skipHeight = height > 32 ? height - 32 : 0;
+ 
+-  int buf[MAX_TX_SQUARE] = { 0 };
++  // Both 1-D passes read and write only buf[0, width * height), so clear
++  // that prefix, not all 64x64 entries: a 16 KB memset per call was 20% of a
++  // speed-3 encode, nearly all of it spent on 4x4 to 16x16 transforms.
++  int buf[MAX_TX_SQUARE];
++  memset(buf, 0, sizeof(*buf) * width * height);
+ 
+   for (int y = 0; y < height; y++) {
+     for (int x = 0; x < width; x++) {
+--- a/av2/encoder/x86/highbd_fwd_txfm_avx2.c	2026-10-14 13:03:31
++++ b/av2/encoder/x86/highbd_fwd_txfm_avx2.c	2026-10-14 13:03:40
+@@ -10,6 +10,7 @@
+  * aomedia.org/license/patent-license/.
+  */
+ #include <assert.h>
++#include <string.h>
+ #include <immintrin.h> /*AVX2*/
+ 
+ #include "config/avm_config.h"
+@@ -5229,7 +5230,11 @@
+   int skipWidth = width > 32 ? width - 32 : 0;
+   int skipHeight = height > 32 ? height - 32 : 0;
+ 
+-  int buf[MAX_TX_SQUARE] = { 0 };
++  // Both 1-D passes read and write only buf[0, width * height), so clear
++  // that prefix, not all 64x64 entries: a 16 KB memset per call was 20% of a
++  // speed-3 encode, nearly all of it spent on 4x4 to 16x16 transforms.
++  int buf[MAX_TX_SQUARE];
++  memset(buf, 0, sizeof(*buf) * width * height);
+ 
+   for (int y = 0; y < height; y++) {
+     for (int x = 0; x < width; x++) {
