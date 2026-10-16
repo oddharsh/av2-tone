@@ -7,6 +7,7 @@ both, and race the encoders and decoders on it.
 demo/build.sh                       # dav2d at a pinned commit, plus the dav1d and dav2d benches
 bun demo/run.ts ~/photo.jpg         # about 6 minutes for a 1600px photo at speed 6
 bun demo/serve.ts                   # http://localhost:8813
+bun demo/race.ts                    # live decoder race over every photo run.ts encoded, about 20 s
 ```
 
 `run.ts` also needs `encoder/build.sh --tuned` and the fast decoder's build.
@@ -38,3 +39,12 @@ machine if you want numbers to quote: the AV2 encoder uses about one core
 per photo, and the decoders' thread pools suffer most when other work holds
 the cores. The encoder race is one encode per arm; the decoder race is best of
 `--reps`.
+
+## The live race
+
+`race.ts` skips encoding: it races the decoders on whatever `run.ts` already
+encoded, so it starts at once. The screen redraws after each decode, checks
+that every AV2 decoder wrote the same pixels on every photo, then replays the
+race at each decoder's measured speed in real time. It pins every decoder to
+one core by default; `--threads 8` races thread pools instead, and
+`--slowmo 4` stretches the replay. Name stems to race a subset.

@@ -28,6 +28,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { inflateSync } from "node:zlib";
 
 const HERE = import.meta.dir;
 const ROOT = path.dirname(HERE);
@@ -100,6 +101,25 @@ async function shAsync(cmd: string[]): Promise<number> {
 }
 const bytes = (f: string) => fs.statSync(f).size;
 
+// A monochrome camera's JPEG carries a GRAY ICC profile, and Bun.Image copies
+// it into the RGB PNG it writes. The PNG spec forbids that pairing: libpng
+// drops the profile with a warning (so avifenc encodes the pixels untagged)
+// and ssimulacra2 refuses the file. Drop it here so every tool reads the same
+// untagged pixels. Any other profile stays.
+function dropGrayIcc(png: Uint8Array): Uint8Array {
+  const dv = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  const type = (o: number) => String.fromCharCode(png[o + 4], png[o + 5], png[o + 6], png[o + 7]);
+  const rgb = png[25] === 2 || png[25] === 6; // IHDR colour type: truecolour, with or without alpha
+  for (let o = 8; o + 12 <= png.length; o += 12 + dv.getUint32(o)) {
+    if (type(o) !== "iCCP") continue;
+    const data = png.subarray(o + 8, o + 8 + dv.getUint32(o));
+    const profile = inflateSync(data.subarray(data.indexOf(0) + 2)); // name, NUL, compression method
+    if (!rgb || String.fromCharCode(...profile.subarray(16, 20)) !== "GRAY") return png;
+    return Buffer.concat([png.subarray(0, o), png.subarray(o + 12 + data.length)]);
+  }
+  return png;
+}
+
 // The primary item's payload (its OBUs) from an AVIF, for av01 or av02.
 function primaryItem(file: string): Uint8Array {
   const buf = new Uint8Array(fs.readFileSync(file));
@@ -153,7 +173,7 @@ type Encoded = { dims: { width: number; height: number }; budget: number; av1Ms:
 async function encode(): Promise<Encoded> {
   // 1. Source
   const img = new Bun.Image(await Bun.file(photo).bytes());
-  await Bun.write(srcPng, await img.resize(SIZE, SIZE, { fit: "inside" }).png().bytes());
+  await Bun.write(srcPng, dropGrayIcc(await img.resize(SIZE, SIZE, { fit: "inside" }).png().bytes()));
   const dims = await new Bun.Image(await Bun.file(srcPng).bytes()).metadata();
   say(`${stem}: ${dims.width}x${dims.height}, load ${loadStart.toFixed(0)} on ${CORES} cores`);
 
