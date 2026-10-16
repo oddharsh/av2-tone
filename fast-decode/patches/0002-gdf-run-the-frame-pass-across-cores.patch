@@ -1,0 +1,409 @@
+From: Aadharsh Pannirselvam <aadharsh@archetype.fund>
+Date: Wed, 14 Oct 2026 10:00:00 -0700
+Subject: [PATCH 2/2] gdf: run the frame pass across cores
+
+The work item is one unit row across the full frame width, with private
+scratch (lap/cls/err) and line-save buffers, and a footprint: the rows of
+the guided copy it may read or rewrite. Items whose footprints don't
+overlap run at once, so they are packed greedily into phases and each
+phase runs on Grand Central Dispatch. A 1600x2400 frame with 4 tile rows
+packs into 3 phases, because each tile row ends in a short stripe whose
+footprint reaches the next tile row's first one. (The first version of
+this patch ran even rows then odd ones and fell back to serial when that
+failed, which it did on every frame with more than one tile row.)
+
+GDF on that frame: 26 ms on one core, 3.7 ms across them. AVM_GDF_ORIG=1
+selects the original pass and AVM_GDF_SERIAL=1 this one in order; 25 of
+25 decodes bit-exact against pristine AVM in every mode.
+
+---
+--- a/av2/common/gdf.c
++++ b/av2/common/gdf.c
+@@ -526,7 +526,7 @@
+   return qp_idx_base;
+ }
+ 
+-void gdf_filter_frame(AV2_COMMON *cm) {
++void gdf_filter_frame_orig(AV2_COMMON *cm) {
+   uint16_t *const rec_pnt = cm->cur_frame->buf.buffers[AVM_PLANE_Y];
+   const int rec_stride = cm->cur_frame->buf.y_stride;
+ 
+@@ -715,5 +715,378 @@
+     }
+   }
+ }
++
++
++/* ---- Parallel GDF -------------------------------------------------------
++ *
++ * gdf_filter_frame_orig walks the frame block by block, and for each block
++ * unit row by unit row. Every unit reads only the guided copy (inp_ptr) and
++ * writes only its own rows of the reconstruction, so units do not depend on
++ * each other's output. What does couple them is state: one set of scratch
++ * buffers (lap/cls/err), one set of line-save buffers, and the reference-line
++ * substitution, which temporarily rewrites GDF_TEST_EXTRA_VER_BORDER full-width
++ * rows of the guided copy above and below the unit row being processed.
++ *
++ * So the work item here is a UNIT ROW across the whole frame width, with its
++ * own copy of the scratch and save buffers, and a footprint: the rows of the
++ * guided copy it may read or rewrite (its rows plus the border either side).
++ * Items whose footprints don't overlap can run at once, so they are packed
++ * into phases greedily, each item into the first phase where it overlaps
++ * nothing, and each phase runs across cores. Two phases cover most frames
++ * (even rows, odd rows); a tile row ending in a short stripe needs a third,
++ * because that stripe's footprint reaches the next tile row's first one.
++ * The result is identical to gdf_filter_frame_orig: same units, same inputs,
++ * same writes. AVM_GDF_ORIG=1 selects the original and AVM_GDF_SERIAL=1 this
++ * pass in order, for A/B checks.
++ */
++#include <stdlib.h>
++#if defined(__APPLE__)
++#include <dispatch/dispatch.h>
++#endif
+ 
++static void gdf_setup_reference_lines_gi(AV2_COMMON *cm, GdfInfo *gi, int i_min,
++                                         int i_max, int frame_stripe,
++                                         int copy_above, int copy_below) {
++  const RestorationStripeBoundaries *rsb = &cm->rst_info[0].boundaries;
++  const int rsb_row = frame_stripe * RESTORATION_CTX_VERT;
++  const int rec_width = cm->cur_frame->buf.y_width;
++  const int buf_x0_off = RESTORATION_BORDER_HORZ;
++  const int buf_stride = rsb->stripe_boundary_stride;
++  const int data_stride = gi->inp_stride;
++  const int line_size = rec_width << 1;
++  const int bd = cm->cur_frame->buf.bit_depth;
++  if (copy_above) {
++    uint16_t *data_tl = gi->inp_ptr + i_min * data_stride;
++    for (int i = -GDF_TEST_EXTRA_VER_BORDER; i < 0; ++i) {
++      const int buf_row = rsb_row + AVMMAX(i + RESTORATION_CTX_VERT, 0);
++      const uint16_t *buf =
++          rsb->stripe_boundary_above + buf_x0_off + buf_row * buf_stride;
++      uint16_t *dst = data_tl + i * data_stride;
++      memcpy(gi->glbs->gdf_save_above[i + GDF_TEST_EXTRA_VER_BORDER],
++             dst - GDF_TEST_EXTRA_HOR_BORDER,
++             line_size + 4 * GDF_TEST_EXTRA_HOR_BORDER);
++      memcpy(dst, buf, line_size);
++      if (bd > GDF_TEST_INP_PREC)
++        for (int j = 0; j < rec_width; j++) dst[j] >>= bd - GDF_TEST_INP_PREC;
++      gdf_extend_frame_highbd(dst, rec_width, 1, data_stride,
++                              GDF_TEST_EXTRA_HOR_BORDER, 0);
++    }
++  }
++  if (copy_below) {
++    uint16_t *data_bl = gi->inp_ptr + i_max * data_stride;
++    for (int i = 0; i < GDF_TEST_EXTRA_VER_BORDER; ++i) {
++      const int buf_row = rsb_row + AVMMIN(i, RESTORATION_CTX_VERT - 1);
++      const uint16_t *src =
++          rsb->stripe_boundary_below + buf_x0_off + buf_row * buf_stride;
++      uint16_t *dst = data_bl + i * data_stride;
++      memcpy(gi->glbs->gdf_save_below[i], dst - GDF_TEST_EXTRA_HOR_BORDER,
++             line_size + 4 * GDF_TEST_EXTRA_HOR_BORDER);
++      memcpy(dst, src, line_size);
++      if (bd > GDF_TEST_INP_PREC)
++        for (int j = 0; j < rec_width; j++) dst[j] >>= bd - GDF_TEST_INP_PREC;
++      gdf_extend_frame_highbd(dst, rec_width, 1, data_stride,
++                              GDF_TEST_EXTRA_HOR_BORDER, 0);
++    }
++  }
++}
++
++static void gdf_unset_reference_lines_gi(AV2_COMMON *cm, GdfInfo *gi, int i_min,
++                                         int i_max, int copy_above,
++                                         int copy_below) {
++  const int rec_width = cm->cur_frame->buf.y_width;
++  const int data_stride = gi->inp_stride;
++  const int line_size = rec_width << 1;
++  if (copy_above) {
++    uint16_t *data_tl = gi->inp_ptr + i_min * data_stride;
++    for (int i = -GDF_TEST_EXTRA_VER_BORDER; i < 0; ++i)
++      memcpy(data_tl + i * data_stride - GDF_TEST_EXTRA_HOR_BORDER,
++             gi->glbs->gdf_save_above[i + GDF_TEST_EXTRA_VER_BORDER],
++             line_size + 4 * GDF_TEST_EXTRA_HOR_BORDER);
++  }
++  if (copy_below) {
++    uint16_t *data_bl = gi->inp_ptr + i_max * data_stride;
++    for (int i = 0; i < GDF_TEST_EXTRA_VER_BORDER; ++i)
++      memcpy(data_bl + i * data_stride - GDF_TEST_EXTRA_HOR_BORDER,
++             gi->glbs->gdf_save_below[i],
++             line_size + 4 * GDF_TEST_EXTRA_HOR_BORDER);
++  }
++}
++
++typedef struct {
++  int tile_row, v_pos, blk_idx_base, frame_stripe;
++  int foot_top, foot_bot;  // rows of the guided copy this item may touch
++} GdfRowJob;
++
++typedef struct {
++  AV2_COMMON *cm;
++  const GdfRowJob *jobs;
++  const int *order;  // the jobs this dispatch runs, by index into jobs
++  int pxl_shift, err_shift, pxl_max, bit_depth, ref_dst_idx;
++  int qp_idx_min, qp_idx_max_plus_1, scale_val;
++} GdfRunCtx;
++
++// A private copy of the GDF state, with its own scratch and save buffers.
++static int gdf_private_info(const GdfInfo *src, GdfInfo *gi) {
++  *gi = *src;
++  const int lap_h = (src->err_height >> 1) + 2;
++  gi->lap_ptr = (uint16_t **)avm_malloc(GDF_NET_INP_GRD_NUM * sizeof(uint16_t *));
++  if (!gi->lap_ptr) return 0;
++  for (int i = 0; i < GDF_NET_INP_GRD_NUM; i++) {
++    gi->lap_ptr[i] = (uint16_t *)avm_memalign(32, lap_h * src->lap_stride * sizeof(uint16_t));
++    if (!gi->lap_ptr[i]) return 0;
++    memset(gi->lap_ptr[i], 0, lap_h * src->lap_stride * sizeof(uint16_t));
++  }
++  gi->cls_ptr = (uint32_t *)avm_memalign(32, lap_h * src->cls_stride * sizeof(uint32_t));
++  gi->err_ptr = (int16_t *)avm_memalign(32, src->err_height * src->err_stride * sizeof(int16_t));
++  gi->glbs = (GDFLineBuffers *)avm_malloc(sizeof(GDFLineBuffers));
++  const size_t lr = (src->gdf_unit_size + 2 * GDF_TEST_EXTRA_VER_BORDER) *
++                    GDF_TEST_EXTRA_HOR_BORDER * sizeof(uint16_t);
++  gi->tmp_save_left = (uint16_t *)avm_malloc(lr);
++  gi->tmp_save_right = (uint16_t *)avm_malloc(lr);
++  if (!gi->cls_ptr || !gi->err_ptr || !gi->glbs || !gi->tmp_save_left || !gi->tmp_save_right) return 0;
++  memset(gi->cls_ptr, 0, lap_h * src->cls_stride * sizeof(uint32_t));
++  memset(gi->err_ptr, 0, src->err_height * src->err_stride * sizeof(int16_t));
++  return 1;
++}
++
++static void gdf_free_private_info(GdfInfo *gi) {
++  if (gi->lap_ptr) {
++    for (int i = 0; i < GDF_NET_INP_GRD_NUM; i++) avm_free(gi->lap_ptr[i]);
++    avm_free(gi->lap_ptr);
++  }
++  avm_free(gi->cls_ptr);
++  avm_free(gi->err_ptr);
++  avm_free(gi->glbs);
++  avm_free(gi->tmp_save_left);
++  avm_free(gi->tmp_save_right);
++}
++
++// One unit row across every tile column and block, exactly as the original
++// body processes it for that (block, v_pos).
++static void gdf_run_row(const GdfRunCtx *c, const GdfRowJob *job, GdfInfo *gi) {
++  AV2_COMMON *cm = c->cm;
++  uint16_t *const rec_pnt = cm->cur_frame->buf.buffers[AVM_PLANE_Y];
++  const int rec_stride = cm->cur_frame->buf.y_stride;
++  const int num_tile_rows = cm->tiles.rows;
++  const int num_tile_cols = cm->tiles.cols;
++  const int tile_row = job->tile_row, v_pos = job->v_pos;
++  TileInfo tile_info;
++  av2_tile_init(&tile_info, cm, tile_row, 0);
++  AV2PixelRect tile_rect = av2_get_tile_rect(&tile_info, cm, 0);
++  const int tile_height = tile_rect.bottom - tile_rect.top;
++  int blk_idx = job->blk_idx_base;
++  for (int tile_col = 0; tile_col < num_tile_cols; ++tile_col) {
++    av2_tile_init(&tile_info, cm, tile_row, tile_col);
++    tile_rect = av2_get_tile_rect(&tile_info, cm, 0);
++    const int tile_width = tile_rect.right - tile_rect.left;
++    for (int x_pos = 0; x_pos < tile_width; x_pos += gi->gdf_block_size, blk_idx++) {
++      int i_min = AVMMAX(v_pos, GDF_TEST_FRAME_BOUNDARY_SIZE) + tile_rect.top;
++      int i_max = AVMMIN(v_pos + gi->gdf_unit_size,
++                         tile_height - GDF_TEST_FRAME_BOUNDARY_SIZE) + tile_rect.top;
++      int copy_above = 1, copy_below = 1;
++      if (cm->seq_params.disable_loopfilters_across_tiles == 0) {
++        if (v_pos == -GDF_TEST_STRIPE_OFF && tile_row != 0) copy_above = 0;
++        if (v_pos + gi->gdf_unit_size >= tile_height && tile_row != num_tile_rows - 1)
++          copy_below = 0;
++      }
++      gdf_setup_reference_lines_gi(cm, gi, i_min, i_max, job->frame_stripe,
++                                   copy_above, copy_below);
++      for (int u_pos = x_pos; u_pos < x_pos + gi->gdf_block_size && u_pos < tile_width;
++           u_pos += gi->gdf_unit_size) {
++        int j_min = AVMMAX(u_pos, GDF_TEST_FRAME_BOUNDARY_SIZE) + tile_rect.left;
++        int j_max = AVMMIN(u_pos + gi->gdf_unit_size,
++                           tile_width - GDF_TEST_FRAME_BOUNDARY_SIZE) + tile_rect.left;
++        const int tile_boundary_left = cm->seq_params.disable_loopfilters_across_tiles
++                                           ? (j_min == tile_rect.left) : (j_min == 0);
++        const int tile_boundary_right = cm->seq_params.disable_loopfilters_across_tiles
++                                            ? (j_max == tile_rect.right)
++                                            : (j_max == cm->cur_frame->buf.y_width);
++        gdf_setup_processing_stripe_leftright_boundary(gi, i_min, i_max, j_min, j_max,
++                                                       tile_boundary_left, tile_boundary_right);
++        int use_gdf_local = 1;
++        if (cm->bru.enabled) {
++          const int mbmi_idx = get_mi_grid_idx(
++              &cm->mi_params, AVMMIN(i_max - 1, (i_min + GDF_TEST_STRIPE_OFF)) >> MI_SIZE_LOG2,
++              j_min >> MI_SIZE_LOG2);
++          use_gdf_local = cm->mi_params.mi_grid_base[mbmi_idx]->local_gdf_mode;
++        }
++        use_gdf_local &= gdf_block_adjust_and_validate(&i_min, &i_max, &j_min, &j_max);
++        if ((gi->gdf_mode == 1 || gi->gdf_block_flags[blk_idx]) && use_gdf_local) {
++          const int bru_blk_skip = !bru_is_sb_active(
++              cm, j_min >> MI_SIZE_LOG2,
++              AVMMIN(i_max - 1, (i_min + GDF_TEST_STRIPE_OFF)) >> MI_SIZE_LOG2);
++          if (cm->bru.enabled && bru_blk_skip)
++            avm_internal_error(&cm->error, AVM_CODEC_ERROR, "GDF on not active SB");
++          for (int qp_idx = c->qp_idx_min; qp_idx < c->qp_idx_max_plus_1; qp_idx++) {
++            gdf_set_lap_and_cls_unit(i_min, i_max, j_min, j_max,
++                                     gi->inp_ptr + gi->inp_stride * (i_min - 1) + (j_min - 1),
++                                     gi->inp_stride, c->bit_depth, gi->lap_ptr,
++                                     gi->lap_stride, gi->cls_ptr, gi->cls_stride);
++            gdf_inference_unit(i_min, i_max, j_min, j_max, qp_idx,
++                               gi->inp_ptr + gi->inp_stride * i_min + j_min,
++                               gi->inp_stride, gi->lap_ptr, gi->lap_stride,
++                               gi->cls_ptr, gi->cls_stride, gi->err_ptr,
++                               gi->err_stride, c->pxl_shift, c->ref_dst_idx);
++            if (cm->features.has_lossless_segment) {
++              const int min_b_size = 1 << MI_SIZE_LOG2;
++              for (int i4 = i_min; i4 < i_max; i4 += min_b_size) {
++                for (int j4 = j_min; j4 < j_max; j4 += min_b_size) {
++                  const int mi_idx = get_mi_grid_idx(&cm->mi_params, i4 >> MI_SIZE_LOG2,
++                                                     j4 >> MI_SIZE_LOG2);
++                  const int is_lossless = cm->features.lossless_segment
++                      [cm->mi_params.mi_grid_base[mi_idx]->segment_id];
++                  if (!is_lossless) {
++                    gdf_compensation_unit_c(
++                        rec_pnt + i4 * rec_stride + j4, rec_stride,
++                        gi->err_ptr + (i4 - i_min) * gi->err_stride + (j4 - j_min),
++                        gi->err_stride, c->err_shift, c->scale_val, c->pxl_max,
++                        AVMMIN(min_b_size, i_max - i4), AVMMIN(min_b_size, j_max - j4));
++                  }
++                }
++              }
++            } else {
++              gdf_compensation_unit(rec_pnt + i_min * rec_stride + j_min, rec_stride,
++                                    gi->err_ptr, gi->err_stride, c->err_shift,
++                                    c->scale_val, c->pxl_max, i_max - i_min,
++                                    j_max - j_min);
++            }
++          }
++        }
++        gdf_restore_processing_stripe_leftright_boundary(gi, i_min, i_max, j_min, j_max,
++                                                         tile_boundary_left, tile_boundary_right);
++      }
++      gdf_unset_reference_lines_gi(cm, gi, i_min, i_max, copy_above, copy_below);
++    }
++  }
++}
++
++static void gdf_run_job(void *ctx, size_t k) {
++  const GdfRunCtx *c = (const GdfRunCtx *)ctx;
++  GdfInfo gi;
++  memset(&gi, 0, sizeof(gi));
++  if (!gdf_private_info(&c->cm->gdf_info, &gi)) {
++    gdf_free_private_info(&gi);
++    avm_internal_error(&c->cm->error, AVM_CODEC_MEM_ERROR, "GDF worker buffers");
++  }
++  gdf_run_row(c, &c->jobs[c->order[k]], &gi);
++  gdf_free_private_info(&gi);
++}
++
++void gdf_filter_frame_orig(AV2_COMMON *cm);
++
++void gdf_filter_frame(AV2_COMMON *cm) {
++  if (getenv("AVM_GDF_ORIG")) {
++    gdf_filter_frame_orig(cm);
++    return;
++  }
++  if (cm->bru.frame_inactive_flag) return;
++  if (cm->bridge_frame_info.is_bridge_frame) return;
++  const int bit_depth = cm->cur_frame->buf.bit_depth;
++  GdfRunCtx c = { 0 };
++  c.cm = cm;
++  c.bit_depth = bit_depth;
++  c.pxl_max = (1 << bit_depth) - 1;
++  c.pxl_shift = GDF_TEST_INP_PREC - AVMMIN(bit_depth, GDF_TEST_INP_PREC);
++  c.err_shift = GDF_RDO_SCALE_NUM_LOG2 + GDF_TEST_INP_PREC - bit_depth;
++  c.ref_dst_idx = gdf_get_ref_dst_idx(cm);
++  c.qp_idx_min = gdf_get_qp_idx_base(cm) + cm->gdf_info.gdf_pic_qp_idx;
++  c.qp_idx_max_plus_1 = c.qp_idx_min + 1;
++  c.scale_val = cm->gdf_info.gdf_pic_scale_idx + 1;
++
++  // Enumerate the unit rows in the original order, with the block index and
++  // stripe number each would have had.
++  const GdfInfo *g = &cm->gdf_info;
++  int cap = 64, n = 0;
++  GdfRowJob *jobs = (GdfRowJob *)avm_malloc(cap * sizeof(*jobs));
++  if (!jobs) avm_internal_error(&cm->error, AVM_CODEC_MEM_ERROR, "GDF jobs");
++  int blk_idx = 0, tile_blk_stripe0 = 0;
++  for (int tile_row = 0; tile_row < cm->tiles.rows; ++tile_row) {
++    TileInfo ti;
++    av2_tile_init(&ti, cm, tile_row, 0);
++    AV2PixelRect rect = av2_get_tile_rect(&ti, cm, 0);
++    const int tile_height = rect.bottom - rect.top;
++    int blocks_across = 0;
++    for (int tile_col = 0; tile_col < cm->tiles.cols; ++tile_col) {
++      av2_tile_init(&ti, cm, tile_row, tile_col);
++      AV2PixelRect r = av2_get_tile_rect(&ti, cm, 0);
++      blocks_across += (r.right - r.left + g->gdf_block_size - 1) / g->gdf_block_size;
++    }
++    for (int y_pos = -GDF_TEST_STRIPE_OFF, blk_idx_h = 0; y_pos < tile_height;
++         y_pos += g->gdf_block_size, blk_idx_h++) {
++      if (blk_idx_h == g->gdf_vert_blks_per_tile[tile_row]) blk_idx -= g->gdf_block_num_w;
++      int blk_stripe = 0;
++      for (int v_pos = y_pos; v_pos < y_pos + g->gdf_block_size && v_pos < tile_height;
++           v_pos += g->gdf_unit_size, blk_stripe++) {
++        if (n == cap) {
++          cap *= 2;
++          GdfRowJob *grown = (GdfRowJob *)avm_malloc(cap * sizeof(*jobs));
++          if (!grown) avm_internal_error(&cm->error, AVM_CODEC_MEM_ERROR, "GDF jobs");
++          memcpy(grown, jobs, n * sizeof(*jobs));
++          avm_free(jobs);
++          jobs = grown;
++        }
++        GdfRowJob *j = &jobs[n++];
++        j->tile_row = tile_row;
++        j->v_pos = v_pos;
++        j->blk_idx_base = blk_idx;
++        j->frame_stripe = tile_blk_stripe0 + blk_stripe;
++        j->foot_top = AVMMAX(v_pos, GDF_TEST_FRAME_BOUNDARY_SIZE) + rect.top -
++                      GDF_TEST_EXTRA_VER_BORDER;
++        j->foot_bot = AVMMIN(v_pos + g->gdf_unit_size, tile_height - GDF_TEST_FRAME_BOUNDARY_SIZE) +
++                      rect.top + GDF_TEST_EXTRA_VER_BORDER;
++      }
++      blk_idx += blocks_across;
++      tile_blk_stripe0 += blk_stripe;
++    }
++  }
++  c.jobs = jobs;
++
++  // order holds the jobs grouped by phase; phase_end[p] is where phase p ends.
++  int *order = (int *)avm_malloc((n > 0 ? n : 1) * sizeof(int));
++  int *phase_of = (int *)avm_malloc((n > 0 ? n : 1) * sizeof(int));
++  if (!order || !phase_of) avm_internal_error(&cm->error, AVM_CODEC_MEM_ERROR, "GDF jobs");
++  int phases = 0;
++  for (int k = 0; k < n; k++) {
++    int p = 0;
++    for (;; p++) {
++      int clash = 0;
++      for (int j = 0; j < k && !clash; j++)
++        clash = phase_of[j] == p && jobs[j].foot_top < jobs[k].foot_bot &&
++                jobs[k].foot_top < jobs[j].foot_bot;
++      if (!clash) break;
++    }
++    phase_of[k] = p;
++    if (p + 1 > phases) phases = p + 1;
++  }
++  int m = 0;
++  int phase_end[64];
++  for (int p = 0; p < phases && p < 64; p++) {
++    for (int k = 0; k < n; k++)
++      if (phase_of[k] == p) order[m++] = k;
++    phase_end[p] = m;
++  }
++  if (getenv("AVM_GDF_DEBUG"))
++    fprintf(stderr, "gdf: %d unit rows in %d phases\n", n, phases);
++
++#if defined(__APPLE__)
++  if (phases <= 64 && !getenv("AVM_GDF_SERIAL")) {
++    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
++    for (int p = 0, start = 0; p < phases; start = phase_end[p++]) {
++      c.order = order + start;
++      dispatch_apply_f((size_t)(phase_end[p] - start), q, &c, gdf_run_job);
++    }
++    avm_free(order);
++    avm_free(phase_of);
++    avm_free(jobs);
++    return;
++  }
++#endif
++  for (int k = 0; k < n; k++) order[k] = k;
++  c.order = order;
++  for (int k = 0; k < n; k++) gdf_run_job(&c, (size_t)k);
++  avm_free(order);
++  avm_free(phase_of);
++  avm_free(jobs);
++}
++
+ #endif  // AVM_COMMON_GDF_H_

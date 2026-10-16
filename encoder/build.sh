@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds six encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds seven encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -55,6 +55,10 @@
 #   0006 fwd-txfm        speed only, no option: the forward transform zeroed a
 #                        16 KB scratch per call, 20% of a speed-3 encode (1 core,
 #                        600px: 37.9 s to 30.7 s; speed 6 about 5%)
+#   0007 tool-unlock     a bitmask that turns back on AV2 tools the speed level
+#                        or libavif switches off: 1 3-way and uneven 4-way
+#                        partitions, 2 IST/CCTX search, 4 TCQ, 8 parity hiding,
+#                        16 loop restoration, 32 every intra mode, 64 DIP
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -181,4 +185,13 @@ cmp -s "$GATE/pristine.avif" "$GATE/tuned.avif" || {
 "$TUNED/avifdec" "$GATE/qmseg.avif" "$GATE/qmseg.tuned.y4m" >/dev/null
 cmp -s "$GATE/qmseg.pristine.y4m" "$GATE/qmseg.tuned.y4m" || {
   echo "error: the reference decoder reads a qmseg file differently" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off, qmseg decodes identically)"
+# 0007's tool-unlock must change the stream (a knob that silently does nothing
+# would score as a tie), and the reference decoder must read what it writes.
+"$TUNED/avifenc" "${BASE[@]}" -a tool-unlock=127 "$IMG" "$GATE/unlock.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/unlock.avif" && {
+  echo "error: tool-unlock=127 wrote the same bytes as no options" >&2; exit 1; }
+"$OUT/avifdec" "$GATE/unlock.avif" "$GATE/unlock.pristine.y4m" >/dev/null
+"$TUNED/avifdec" "$GATE/unlock.avif" "$GATE/unlock.tuned.y4m" >/dev/null
+cmp -s "$GATE/unlock.pristine.y4m" "$GATE/unlock.tuned.y4m" || {
+  echo "error: the reference decoder reads a tool-unlock file differently" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg and tool-unlock decode identically)"

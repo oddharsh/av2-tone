@@ -13,15 +13,15 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: six encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: seven encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
 | `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
 | `demo/` | encodes your photo as AV1 and AV2 at the same byte count, races the encoders and the decoders (AVM, the fast decoder, dav2d, dav1d) on it, and shows both images on a local page |
 
-Coming: a fast native decoder (NEON GDF and a parallel frame pass, 2.9x faster than
-AVM on one core) and a safe-Rust still-image decoder. The Rust decoder is the
-`av2-tone` crate this repo is named for, and it hasn't started yet.
+Coming: a safe-Rust still-image decoder. It's the `av2-tone` crate this repo
+is named for, and it hasn't started yet.
 
 ## Build
 
@@ -42,6 +42,15 @@ metal/run.sh
 wasm/build.sh
 ```
 
+```bash
+fast-decode/build.sh
+bun fast-decode/check.ts <dir of AV2 .avif files>
+```
+
+`fast-decode/build.sh` builds a pristine and a fast decoder from the source
+`encoder/build.sh` fetched, and `check.ts` refuses any byte of difference
+between them, at one thread and at every core.
+
 `metal/run.sh` encodes the fixture at four quantizers, decodes them, and
 requires the GPU's GDF to match AVM's on every pixel for all 36 filter table
 sets. `wasm/build.sh` writes `wasm/build/av2dec.<sha8>.wasm`.
@@ -55,6 +64,21 @@ Measured on an M3 Max with other work running, so read them as approximate.
   transform, which was 20% of the encode.
 - **GDF on a 1600x2400 frame:** 211 ms in AVM's C on one core, 3.7 ms in NEON
   across all cores, about 0.8 ms on the GPU.
+- **AV2 tools speed 6 switches off, 2026-10-16.** At speed 6 through libavif,
+  AVM encodes with no 3-way or uneven 4-way partitions, no TCQ, parity hiding,
+  loop restoration or DIP, and it never searches the IST/CCTX transforms.
+  Patch 0007 turns each back on with one bit of `-a tool-unlock=`. Scored at
+  matched bytes against aadhar.sh's shipped AVIF on 600px tiles: 20 tiles
+  screened, then the two winners confirmed on 20 held-out tiles, weighted to
+  the 162 tiles that site ships. On the held-out set, plain speed 6 ties AVIF
+  (+0.03 ssimulacra2). TCQ alone adds +0.53 and the IST/CCTX search +0.55;
+  together (`tool-unlock=6`) they reach +1.02, and AV2 wins about 148 of
+  162 tiles, up from 116. Butteraugli agrees on 19 of 20. Partitions, parity
+  hiding, loop restoration, the intra-mode mask and DIP each moved the screen
+  by +0.07 or less. TCQ and IST/CCTX cost the decoder nothing measurable;
+  loop restoration costs it about 4x on one core. The encoder pays: one 600px
+  tile with qmseg on took 12 s at speed 6 and 33 s with `tool-unlock=6`, 37 s
+  at speed 3 and 145 s with it.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 

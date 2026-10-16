@@ -40,8 +40,14 @@
 //   - `grep -q` against `nm` under pipefail reports a symbol missing when it is
 //     present (SIGPIPE), which made a gate refuse a good build. Count instead.
 //
+// DECODER MODE (--decoder, for ../fast-decode/build.sh): --build names a
+// decoder-only AVM build (config/ and libavm.a at its top) instead of a libavif
+// tree. Encoder kernels are left out, the shared x86 files that only encoder
+// prototypes declare are skipped instead of refused, and the objects are
+// appended to libavm.a without relinking any app.
+//
 // usage: bun simde.ts --src <patched AVM source> --build <libavif build dir>
-//                     --simde <simde checkout> --work <scratch dir>
+//                     --simde <simde checkout> --work <scratch dir> [--decoder]
 import fs from "node:fs";
 import path from "node:path";
 
@@ -52,8 +58,10 @@ const arg = (name: string): string => {
   return path.resolve(v);
 };
 const SRC = arg("src"), BUILD = arg("build"), SIMDE = arg("simde"), WORK = arg("work");
-const CFG = path.join(BUILD, "_deps/libavm-build/config");
-const LIB = path.join(BUILD, "_deps/libavm-build/libavm.a");
+const DECODER = process.argv.includes("--decoder");
+const AVM_BUILD = DECODER ? BUILD : path.join(BUILD, "_deps/libavm-build");
+const CFG = path.join(AVM_BUILD, "config");
+const LIB = path.join(AVM_BUILD, "libavm.a");
 const HEADERS = ["av2_rtcd", "avm_dsp_rtcd", "avm_scale_rtcd"] as const;
 const DEFS: Record<(typeof HEADERS)[number], string> = {
   av2_rtcd: "av2/common/av2_rtcd_defs.pl",
@@ -151,9 +159,9 @@ function merge(defined: Set<string>): { headers: Record<string, string>; moved: 
   return { headers, moved };
 }
 const kernelSources = [
-  ...["av2/common/x86", "avm_dsp/x86", "av2/encoder/x86"].flatMap((d) =>
+  ...["av2/common/x86", "avm_dsp/x86", ...(DECODER ? [] : ["av2/encoder/x86"])].flatMap((d) =>
     fs.readdirSync(path.join(SRC, d)).filter((f) => f.endsWith(".c") && f !== "avm_asm_stubs.c").map((f) => `${d}/${f}`)),
-  ...fs.readdirSync(path.join(SRC, "avm_dsp/flow_estimation/x86")).filter((f) => f.startsWith("corner_match_") && f.endsWith(".c"))
+  ...(DECODER ? [] : fs.readdirSync(path.join(SRC, "avm_dsp/flow_estimation/x86"))).filter((f) => f.startsWith("corner_match_") && f.endsWith(".c"))
     .map((f) => `avm_dsp/flow_estimation/x86/${f}`),
   "av2/common/gdf_block_avx2.c",
 ];
@@ -166,7 +174,7 @@ function compile(): string[] {
     const o = path.join(objDir, `${f.replaceAll("/", "_").replace(/\.c$/, "")}.o`);
     const r = Bun.spawnSync(["clang", "-c", "-O3", "-std=gnu11", "-fPIC", "-DNDEBUG", "-D_FILE_OFFSET_BITS=64",
       "-DSIMDE_NO_CHECK_IMMEDIATE_CONSTANT", "-w", `-I${shim}`, `-I${SIMDE}`, `-I${path.dirname(cfgX86)}`,
-      `-I${path.join(BUILD, "_deps/libavm-build")}`, `-I${SRC}`, `-I${path.join(SRC, "third_party/tensorflow")}`,
+      `-I${AVM_BUILD}`, `-I${SRC}`, `-I${path.join(SRC, "third_party/tensorflow")}`,
       path.join(SRC, f), "-o", o], { stdout: "ignore", stderr: "ignore" });
     if (r.exitCode !== 0) failed.push(f);
   }
@@ -221,7 +229,8 @@ for (let round = 1; ; round++) {
     write(path.join(cfgX86, `${h}.h`), withProtos);
   }
   const failed = compile();
-  if (failed.length) throw new Error(`failed against the merged dispatch: ${failed.join(", ")}`);
+  if (failed.length && !DECODER) throw new Error(`failed against the merged dispatch: ${failed.join(", ")}`);
+  if (failed.length) console.error(`skipped, encoder-only: ${failed.map((f) => path.basename(f)).join(", ")}`);
   const c = close(baseSyms);
   kept = c.kept;
   const stable = c.defined.size === defined.size && [...c.defined].every((s) => defined.has(s));
@@ -237,12 +246,16 @@ for (const h of HEADERS) {
   const now = new Date();
   fs.utimesSync(path.join(CFG, `${h}.h`), now, now);
 }
-const build = () => Bun.spawnSync(["cmake", "--build", BUILD, "--target", "avifenc", "avifdec"], { stdout: "pipe", stderr: "pipe" });
+const build = () => Bun.spawnSync(DECODER ? ["ninja", "-C", BUILD, "avm"] : ["cmake", "--build", BUILD, "--target", "avifenc", "avifdec"], { stdout: "pipe", stderr: "pipe" });
 const first = build().stdout.toString();
 if (/Generating .*_rtcd\.h/.test(first)) throw new Error("ninja regenerated the rtcd headers over the merged ones");
 run(["ar", "rs", LIB, ...kept.map((o) => path.join(objDir, o))]);
 const now = new Date();
 fs.utimesSync(LIB, now, now);
+if (DECODER) {
+  console.error(`SIMDe kernels appended to the decoder library: ${kept.length} objects`);
+  process.exit(0);
+}
 const second = build();
 if (second.exitCode !== 0) throw new Error(`relink failed:\n${second.stdout.toString().slice(-2000)}`);
 const linked = run(["nm", path.join(BUILD, "avifenc")]).split("\n").filter((l) => l.endsWith(" _fwd_txfm_avx2")).length;

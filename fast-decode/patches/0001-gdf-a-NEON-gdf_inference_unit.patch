@@ -1,0 +1,287 @@
+From 9691ff91e074ed88c2a55b1028d909c925514cf3 Mon Sep 17 00:00:00 2001
+From: Aadharsh Pannirselvam <aadharsh@archetype.fund>
+Date: Tue, 13 Oct 2026 23:03:49 -0700
+Subject: [PATCH 1/2] gdf: a NEON gdf_inference_unit
+
+Eight pixels per step. Per-class constants come from one byte-table lookup
+per input (vqtbl1q_u8) instead of the AVX2 gather-and-swap; inputs stay in
+int16 and only the three accumulators widen to int32. The vertical and
+horizontal sparsity masks swap meaning with class parity (the AVX2 code
+swaps sums 0 and 1 for odd classes), so they can only skip both sums
+together. Columns past the last multiple of 8 go to the C kernel.
+
+Bit-exact: 600 randomized unit trials against gdf_inference_unit_c (intra
+and all inter tables, every qp table, both bit-depth shifts, odd tails),
+and 18 of 18 whole decodes against pristine AVM. Single-threaded decode of
+a 1600x2400 10-bit 4:4:4 still on an M3 Max: 314 ms to 127 ms.
+---
+ av2/av2.cmake                   |   1 +
+ av2/common/arm/gdf_block_neon.c | 230 ++++++++++++++++++++++++++++++++
+ av2/common/av2_rtcd_defs.pl     |   2 +-
+ 3 files changed, 232 insertions(+), 1 deletion(-)
+ create mode 100644 av2/common/arm/gdf_block_neon.c
+
+diff --git a/av2/av2.cmake b/av2/av2.cmake
+index 2738bda..c8875e7 100644
+--- a/av2/av2.cmake
++++ b/av2/av2.cmake
+@@ -440,6 +440,7 @@ list(
+   "${AVM_ROOT}/av2/common/arm/convolve_neon.c"
+   "${AVM_ROOT}/av2/common/arm/convolve_neon.h"
+   "${AVM_ROOT}/av2/common/arm/reconinter_neon.c"
++  "${AVM_ROOT}/av2/common/arm/gdf_block_neon.c"
+   "${AVM_ROOT}/av2/common/cdef_block_neon.c")
+ 
+ list(APPEND AVM_AV2_ENCODER_INTRIN_SSE4_2
+diff --git a/av2/common/arm/gdf_block_neon.c b/av2/common/arm/gdf_block_neon.c
+new file mode 100644
+index 0000000..c7c3329
+--- /dev/null
++++ b/av2/common/arm/gdf_block_neon.c
+@@ -0,0 +1,230 @@
++/*
++ * NEON GDF inference: gdf_inference_unit_c, eight pixels at a time.
++ *
++ * Per pixel, GDF reads 18 neighbour-difference pairs and 4 gradients, clips
++ * each by a class-dependent bound, accumulates them into three sums with
++ * class-dependent weights, and turns the sums into an index into an int8
++ * error table. The class is per 2x2 block, so a group of 8 pixels carries 4
++ * classes; per-class constants are fetched with one byte-table lookup per
++ * input (vqtbl1q_u8), which replaces the AVX2 version's gather-and-swap.
++ *
++ * Inputs are clipped to 10-bit precision, so differences and clips fit in
++ * int16 and only the accumulators need int32 (vmlal_s16), as in the C.
++ * Zero weights are skipped with the AVX2 code's sparsity masks, minding that
++ * its vertical/horizontal masks swap meaning with class parity.
++ * Columns past the last multiple of 8 go to the C kernel.
++ */
++#include <arm_neon.h>
++#include <string.h>
++
++#include "config/av2_rtcd.h"
++#include "av2/common/gdf_block.h"
++
++// Byte indices that expand a per-lane class (0..3, one per lane) into the two
++// bytes of an int16 table entry: lane l -> {2c, 2c+1}.
++static inline uint8x16_t class_bytes16(uint16x8_t cls) {
++  const uint8x16_t c = vreinterpretq_u8_u16(vshlq_n_u16(cls, 1));  // 2c in low byte
++  const uint8x16_t lo = vtrn1q_u8(c, c);                           // {2c, 2c}
++  return vaddq_u8(lo, vreinterpretq_u8_u16(vdupq_n_u16(0x0100)));  // {2c, 2c+1}
++}
++
++// Byte indices for an int32 table entry, 4 lanes: lane l -> {4c..4c+3}.
++static inline uint8x16_t class_bytes32(uint32x4_t cls) {
++  const uint8x16_t c = vreinterpretq_u8_u32(vshlq_n_u32(cls, 2));  // 4c in byte 0
++  static const uint8_t spread[16] = { 0, 0, 0, 0, 4, 4, 4, 4,
++                                      8, 8, 8, 8, 12, 12, 12, 12 };
++  const uint8x16_t rep = vqtbl1q_u8(c, vld1q_u8(spread));
++  return vaddq_u8(rep, vreinterpretq_u8_u32(vdupq_n_u32(0x03020100)));
++}
++
++// The four int16 per-class values at p, as a lookup table.
++static inline uint8x16_t table4_s16(const int16_t *p) {
++  return vcombine_u8(vld1_u8((const uint8_t *)p), vdup_n_u8(0));
++}
++
++static inline int16x8_t lookup_s16(const int16_t *p, uint8x16_t idx) {
++  return vreinterpretq_s16_u8(vqtbl1q_u8(table4_s16(p), idx));
++}
++
++static inline int32x4_t lookup_s32(const int32_t *p, uint8x16_t idx) {
++  return vreinterpretq_s32_u8(vqtbl1q_u8(vld1q_u8((const uint8_t *)p), idx));
++}
++
++void gdf_inference_unit_neon(const int i_min, const int i_max, const int j_min,
++                             const int j_max, const int qp_idx,
++                             const uint16_t *rec_pnt, const int rec_stride,
++                             uint16_t *const *gdf_lap_pnt,
++                             const int gdf_lap_stride,
++                             const uint32_t *gdf_cls_pnt,
++                             const int gdf_cls_stride, int16_t *err_pnt,
++                             const int err_stride, const int pxl_shift,
++                             const int ref_dst_idx) {
++  const int blk_height = i_max - i_min;
++  const int blk_width = j_max - j_min;
++  const int vec_width = blk_width & ~7;
++
++  const int is_intra = ref_dst_idx == 0;
++  const int frm_max =
++      is_intra ? GDF_NET_LUT_IDX_INTRA_MAX : GDF_NET_LUT_IDX_INTER_MAX;
++  const int idx_min = -(frm_max >> 1);
++  const int idx_max = frm_max - 1 + idx_min;
++  const int idx_scale = AVMMAX(-idx_min, idx_max);
++  const int32_t shift =
++      GDF_TEST_INP_PREC - GDF_TRAIN_INP_PREC + GDF_TRAIN_PAR_SCALE_LOG2;
++  const int32_t shift_half = 1 << (shift - 1);
++
++  const int16_t *alpha, *weight;
++  const int32_t *bias;
++  const int8_t *table;
++  if (is_intra) {
++    alpha = gdf_intra_alpha_table[qp_idx];
++    weight = gdf_intra_weight_table[qp_idx];
++    bias = gdf_intra_bias_table[qp_idx];
++    table = gdf_intra_error_table[qp_idx];
++  } else {
++    alpha = gdf_inter_alpha_table[ref_dst_idx - 1][qp_idx];
++    weight = gdf_inter_weight_table[ref_dst_idx - 1][qp_idx];
++    bias = gdf_inter_bias_table[ref_dst_idx - 1][qp_idx];
++    table = gdf_inter_error_table[ref_dst_idx - 1][qp_idx];
++  }
++  // index = a * frm_max^2 + b * frm_max + c
++  const int off0 = frm_max * frm_max, off1 = frm_max;
++
++  const int16x8_t vshift = vdupq_n_s16((int16_t)pxl_shift);
++  const int16x8_t inp_min = vdupq_n_s16(-(1 << (GDF_TEST_INP_PREC - 1)));
++  const int16x8_t inp_max = vdupq_n_s16((1 << (GDF_TEST_INP_PREC - 1)) - 1);
++  const int32x4_t vscale = vdupq_n_s32(idx_scale);
++  const int32x4_t vhalf = vdupq_n_s32(shift_half);
++  const int32x4_t vnshift = vdupq_n_s32(-shift);
++  const int32x4_t vidx_min = vdupq_n_s32(-idx_min);
++  const int32x4_t vzero = vdupq_n_s32(0);
++  const int32x4_t vtop = vdupq_n_s32(frm_max - 1);
++  const int32x4_t voff0 = vdupq_n_s32(off0), voff1 = vdupq_n_s32(off1);
++
++  // Address offsets of each guided sample, relative to the centre pixel.
++  int fwd_off[GDF_NET_INP_REC_NUM], bwd_off[GDF_NET_INP_REC_NUM];
++  for (int k = 0; k < GDF_NET_INP_REC_NUM; k++) {
++    fwd_off[k] = gdf_guided_sample_coordinates_fwd[k][0] * rec_stride +
++                 gdf_guided_sample_coordinates_fwd[k][1];
++    bwd_off[k] = gdf_guided_sample_coordinates_bwd[k][0] * rec_stride +
++                 gdf_guided_sample_coordinates_bwd[k][1];
++  }
++  const int wstride = GDF_OPTS_INP_TOT * GDF_TRAIN_CLS_NUM;
++
++  uint16_t *lap[GDF_NET_INP_GRD_NUM];
++  memcpy(lap, gdf_lap_pnt, sizeof(lap));
++  const uint32_t *cls_line = gdf_cls_pnt;
++  const uint16_t *rec = rec_pnt;
++  int16_t *err = err_pnt;
++
++  for (int i = 0; i < blk_height; i++) {
++    for (int j = 0; j < vec_width; j += 8) {
++      // Classes for 8 pixels: 4 entries, each covering 2 columns.
++      const uint32x4_t c4 = vld1q_u32(cls_line + (j >> 1));
++      const uint16x4_t c4n = vmovn_u32(c4);
++      const uint16x8_t cls8 = vzip1q_u16(vcombine_u16(c4n, c4n),
++                                         vcombine_u16(c4n, c4n));
++      const uint8x16_t ib16 = class_bytes16(cls8);
++      // int32 lanes: pixels 0..3 use classes c0,c0,c1,c1; 4..7 use c2,c2,c3,c3
++      const uint32x4_t clo = vzip1q_u32(c4, c4), chi = vzip2q_u32(c4, c4);
++      const uint8x16_t ib32lo = class_bytes32(clo), ib32hi = class_bytes32(chi);
++
++      int32x4_t acc[3][2];
++      for (int n = 0; n < 3; n++) {
++        acc[n][0] = lookup_s32(bias + GDF_TRAIN_CLS_NUM * n, ib32lo);
++        acc[n][1] = lookup_s32(bias + GDF_TRAIN_CLS_NUM * n, ib32hi);
++      }
++
++      const int16x8_t centre = vreinterpretq_s16_u16(vld1q_u16(rec + j));
++      for (int k = 0; k < GDF_NET_INP_REC_NUM; k++) {
++        const int16x8_t f = vreinterpretq_s16_u16(vld1q_u16(rec + j + fwd_off[k]));
++        const int16x8_t b = vreinterpretq_s16_u16(vld1q_u16(rec + j + bwd_off[k]));
++        const int16x8_t a = lookup_s16(alpha + k * GDF_TRAIN_CLS_NUM, ib16);
++        const int16x8_t na = vnegq_s16(a);
++        const int16x8_t df = vminq_s16(vmaxq_s16(vshlq_s16(vsubq_s16(f, centre), vshift), na), a);
++        const int16x8_t db = vminq_s16(vmaxq_s16(vshlq_s16(vsubq_s16(b, centre), vshift), na), a);
++        const int16x8_t x = vminq_s16(vmaxq_s16(vaddq_s16(df, db), inp_min), inp_max);
++        const int16_t *wk = weight + k * GDF_TRAIN_CLS_NUM;
++        // The vertical and horizontal masks name sums 0 and 1 for even classes
++        // and the other way round for odd ones (the AVX2 code swaps them by
++        // class parity), so per pixel they can only be skipped together.
++        const int vh = gdf_guided_sample_vertical_masks[k] |
++                       gdf_guided_sample_horizontal_masks[k];
++        if (vh) {
++          const int16x8_t w = lookup_s16(wk, ib16);
++          acc[0][0] = vmlal_s16(acc[0][0], vget_low_s16(x), vget_low_s16(w));
++          acc[0][1] = vmlal_high_s16(acc[0][1], x, w);
++        }
++        if (vh) {
++          const int16x8_t w = lookup_s16(wk + wstride, ib16);
++          acc[1][0] = vmlal_s16(acc[1][0], vget_low_s16(x), vget_low_s16(w));
++          acc[1][1] = vmlal_high_s16(acc[1][1], x, w);
++        }
++        if (gdf_guided_sample_mixed_masks[k]) {
++          const int16x8_t w = lookup_s16(wk + 2 * wstride, ib16);
++          acc[2][0] = vmlal_s16(acc[2][0], vget_low_s16(x), vget_low_s16(w));
++          acc[2][1] = vmlal_high_s16(acc[2][1], x, w);
++        }
++      }
++      for (int g = 0; g < GDF_NET_INP_GRD_NUM; g++) {
++        const int k = GDF_NET_INP_REC_NUM + g;
++        // (lap << shift) >> GRD_SHIFT in 32 bits, as the C does
++        const uint16x8_t l = vld1q_u16(lap[g] + j);
++        const int32x4_t s32 = vdupq_n_s32(pxl_shift);
++        int32x4_t lo = vreinterpretq_s32_u32(vshlq_u32(vmovl_u16(vget_low_u16(l)), s32));
++        int32x4_t hi = vreinterpretq_s32_u32(vshlq_u32(vmovl_high_u16(l), s32));
++        lo = vshrq_n_s32(lo, GDF_TRAIN_GRD_SHIFT);
++        hi = vshrq_n_s32(hi, GDF_TRAIN_GRD_SHIFT);
++        const int16x8_t a = lookup_s16(alpha + k * GDF_TRAIN_CLS_NUM, ib16);
++        const int32x4_t alo = vmovl_s16(vget_low_s16(a)), ahi = vmovl_high_s16(a);
++        lo = vminq_s32(vmaxq_s32(lo, vnegq_s32(alo)), alo);
++        hi = vminq_s32(vmaxq_s32(hi, vnegq_s32(ahi)), ahi);
++        int16x8_t x = vcombine_s16(vmovn_s32(lo), vmovn_s32(hi));
++        x = vminq_s16(vmaxq_s16(x, inp_min), inp_max);
++        const int16_t *wk = weight + k * GDF_TRAIN_CLS_NUM;
++        for (int n = 0; n < 3; n++) {
++          const int16x8_t w = lookup_s16(wk + n * wstride, ib16);
++          acc[n][0] = vmlal_s16(acc[n][0], vget_low_s16(x), vget_low_s16(w));
++          acc[n][1] = vmlal_high_s16(acc[n][1], x, w);
++        }
++      }
++
++      // GDF_NORM_IDX, clip, and combine the three indices.
++      int32x4_t lut[2] = { vdupq_n_s32(0), vdupq_n_s32(0) };
++      for (int n = 0; n < 3; n++) {
++        for (int h = 0; h < 2; h++) {
++          const int32x4_t v = acc[n][h];
++          const int32x4_t t =
++              vshlq_s32(vmlaq_s32(vhalf, vabsq_s32(v), vscale), vnshift);
++          const uint32x4_t pos = vcgtq_s32(v, vzero);
++          int32x4_t r = vbslq_s32(pos, t, vnegq_s32(t));
++          r = vminq_s32(vmaxq_s32(vaddq_s32(r, vidx_min), vzero), vtop);
++          const int32x4_t m = n == 0 ? voff0 : n == 1 ? voff1 : vdupq_n_s32(1);
++          lut[h] = vmlaq_s32(lut[h], r, m);
++        }
++      }
++      int32_t idx[8];
++      vst1q_s32(idx, lut[0]);
++      vst1q_s32(idx + 4, lut[1]);
++      for (int p = 0; p < 8; p++) err[j + p] = table[idx[p]];
++    }
++    if (i & 1) {
++      cls_line += gdf_cls_stride;
++      for (int g = 0; g < GDF_NET_INP_GRD_NUM; g++) lap[g] += gdf_lap_stride;
++    }
++    rec += rec_stride;
++    err += err_stride;
++  }
++
++  if (vec_width < blk_width) {
++    // The last columns, through the C kernel with every pointer moved over.
++    uint16_t *tail_lap[GDF_NET_INP_GRD_NUM];
++    for (int g = 0; g < GDF_NET_INP_GRD_NUM; g++)
++      tail_lap[g] = gdf_lap_pnt[g] + vec_width;
++    gdf_inference_unit_c(i_min, i_max, j_min + vec_width, j_max, qp_idx,
++                         rec_pnt + vec_width, rec_stride, tail_lap,
++                         gdf_lap_stride, gdf_cls_pnt + (vec_width >> 1),
++                         gdf_cls_stride, err_pnt + vec_width, err_stride,
++                         pxl_shift, ref_dst_idx);
++  }
++}
+diff --git a/av2/common/av2_rtcd_defs.pl b/av2/common/av2_rtcd_defs.pl
+index b57fddb..a85d814 100644
+--- a/av2/common/av2_rtcd_defs.pl
++++ b/av2/common/av2_rtcd_defs.pl
+@@ -349,7 +349,7 @@ if ($opts{config} !~ /libs-x86-win32-vs.*/) {
+   add_proto qw/void gdf_set_lap_and_cls_unit/, "const int i_min, const int i_max, const int j_min, const int j_max, const uint16_t *rec_pnt, const int rec_stride, const int bit_depth, uint16_t *const *gdf_lap_y, const int gdf_lap_y_stride, uint32_t *gdf_cls_y, const int gdf_cls_y_stride";
+   specialize qw/gdf_set_lap_and_cls_unit avx2/;
+   add_proto qw/void gdf_inference_unit/, "const int i_min, const int i_max, const int j_min, const int j_max, const int qp_idx, const uint16_t* rec_pnt, const int rec_stride, uint16_t *const *gdf_lap_pnt, const int gdf_lap_stride, const uint32_t *gdf_cls_pnt, const int gdf_cls_stride, int16_t* err_pnt, const int err_stride, const int pxl_shift, const int ref_dst_idx";
+-  specialize qw/gdf_inference_unit avx2/;
++  specialize qw/gdf_inference_unit avx2 neon/;
+   add_proto qw/void gdf_compensation_unit/, "uint16_t* rec_pnt, const int rec_stride, int16_t* err_pnt, const int err_stride, const int err_shift, const int scale, const int pxl_max, const int blk_height, const int blk_width";
+   specialize qw/gdf_compensation_unit avx2/;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
