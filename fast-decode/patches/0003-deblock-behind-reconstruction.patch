@@ -1,0 +1,624 @@
+From: Aadharsh Pannirselvam <aadharsh@archetype.fund>
+Date: Wed, 14 Oct 2026 16:00:00 -0700
+Subject: [PATCH 3/3] decoder: deblock behind reconstruction
+
+AVM deblocks after the last tile is decoded, so on a frame whose tiles
+finish unevenly the filter waits for the slowest one. av2/decoder/
+lf_pipeline.c runs the same filter (AVM's own vert/horz functions) as
+per-row, per-plane tasks on Grand Central Dispatch: V(r) once rows r and
+r+1 are reconstructed in every tile column, H(r) after V(r-1) and V(r).
+
+Every photo in the corpus allows global IntraBC, which predicts from
+unfiltered pixels anywhere above. A task copies each finished row of each
+tile column into an unfiltered shadow; V(r) waits for row r's copies, and
+IntraBC reads that start above row r-1 go to the shadow (IbcShadow in
+blockd.h, decided in dec_calc_subpel_params_and_extend and the morph
+template). Rows r-1 and r stay on the frame: nothing filters them while
+row r decodes.
+
+Inter frames, row-MT and single-threaded decodes keep the usual pass;
+AVM_LF_PIPELINE=0 turns it off. 25 of 25 bit-exact; 2,000+ decodes at
+2-14 threads hash identically. Two controls fail as they should: reading
+the frame instead of the shadow changes 3 files, and dropping V(r)'s wait
+on row r+1 makes decodes differ run to run.
+---
+--- a/av2/av2.cmake
++++ b/av2/av2.cmake
+@@ -161,6 +161,8 @@
+   "${AVM_ROOT}/av2/decoder/decodetxb.h"
+   "${AVM_ROOT}/av2/decoder/detokenize.c"
+   "${AVM_ROOT}/av2/decoder/detokenize.h"
++  "${AVM_ROOT}/av2/decoder/lf_pipeline.c"
++  "${AVM_ROOT}/av2/decoder/lf_pipeline.h"
+   "${AVM_ROOT}/av2/decoder/dthread.h"
+   "${AVM_ROOT}/av2/decoder/obu.h"
+   "${AVM_ROOT}/av2/decoder/obu_qm.c"
+--- a/av2/common/av2_common_int.h
++++ b/av2/common/av2_common_int.h
+@@ -3636,6 +3636,7 @@
+ 
+ static INLINE void av2_init_macroblockd(AV2_COMMON *cm, MACROBLOCKD *xd) {
+   const int num_planes = av2_num_planes(cm);
++  xd->ibc_shadow = NULL;
+   const CommonQuantParams *const quant_params = &cm->quant_params;
+ 
+   for (int i = 0; i < num_planes; ++i) {
+--- a/av2/common/blockd.h
++++ b/av2/common/blockd.h
+@@ -1869,6 +1869,25 @@
+   int_mv global_mvs[2];
+ } SKIP_MODE_MVP_LIST;
+ 
++/*! \brief An unfiltered copy of the frame being decoded, for IntraBC.
++ *
++ * When in-loop filters run behind reconstruction (av2/decoder/lf_pipeline.c),
++ * superblock rows two or more above the current one may already be filtered,
++ * yet IntraBC must predict from unfiltered pixels. Each finished row is copied
++ * here before any filter touches it, and IntraBC reads that reach those rows
++ * are served from the copy.
++ */
++typedef struct IbcShadow {
++  /*! Plane base pointers of the frame (buf_2d.buf0) */
++  const uint16_t *live[MAX_MB_PLANE];
++  /*! Offset from a frame pixel to the same pixel of the copy, per plane */
++  ptrdiff_t delta[MAX_MB_PLANE];
++  /*! log2 of the superblock height in luma pixels */
++  int sb_size_log2;
++  /*! Blocks until superblock rows first..last of a tile column are copied */
++  void (*wait)(const struct IbcShadow *s, int first, int last, int tile_col);
++} IbcShadow;
++
+ /*! \brief Variables related to current coding block.
+  *
+  * This is a common set of variables used by both encoder and decoder.
+@@ -2219,6 +2238,12 @@
+   struct avm_internal_error_info *error_info;
+ 
+   /*!
++   * Unfiltered copy for IntraBC reads above the previous superblock row, or
++   * NULL when the frame is filtered after decoding.
++   */
++  const IbcShadow *ibc_shadow;
++
++  /*!
+    * Same as cm->global_motion.
+    */
+   const WarpedMotionParams *global_motion;
+@@ -2325,6 +2350,33 @@
+   /*! \brief Flag to indicate whether reduced transform partition mode is on */
+   int reduced_tx_part_set;
+ } MACROBLOCKD;
++
++/*!\brief The offset that moves an IntraBC read into the unfiltered copy.
++ *
++ * While superblock row r decodes, no filter has touched rows r-1 or r, so a
++ * read that starts in either stays on the frame (offset 0). A read that starts
++ * higher goes to the copy, after waiting for the rows it covers to land there.
++ * A block is never taller than a superblock, so such a read ends by row r-1.
++ * buf0 is the plane's base pointer, top_y and bottom_y the first and last
++ * plane rows read, mi_y the block's luma row.
++ */
++static INLINE ptrdiff_t av2_ibc_shadow_delta(const IbcShadow *s,
++                                             const uint16_t *buf0, int top_y,
++                                             int bottom_y, int mi_y, int ss_y,
++                                             int tile_col) {
++  if (!s) return 0;
++  const int cur = mi_y >> s->sb_size_log2;
++  const int first = AVMMAX((top_y << ss_y) >> s->sb_size_log2, 0);
++  if (first >= cur - 1) return 0;
++  const int last = AVMMIN((bottom_y << ss_y) >> s->sb_size_log2, cur - 1);
++  for (int p = 0; p < MAX_MB_PLANE; p++) {
++    if (buf0 == s->live[p]) {
++      s->wait(s, first, last, tile_col);
++      return s->delta[p];
++    }
++  }
++  return 0;
++}
+ 
+ /*!\cond */
+ 
+--- a/av2/common/reconinter.c
++++ b/av2/common/reconinter.c
+@@ -4117,6 +4117,9 @@
+   uint16_t *recon_top = dst - BAWP_REF_LINES * dst_stride;
+   uint16_t *recon_left = dst - BAWP_REF_LINES;
+   uint16_t *ref_buf = recon_buf + dv.row * dst_stride + dv.col;
++  ref_buf += av2_ibc_shadow_delta(
++      xd->ibc_shadow, xd->plane[0].dst.buf0, cur_y + dv.row - BAWP_REF_LINES,
++      cur_y + dv.row + ref_h - 1, mi_row * MI_SIZE, 0, xd->tile.tile_col);
+   uint16_t *ref_top = ref_buf - BAWP_REF_LINES * dst_stride;
+   uint16_t *ref_left = ref_buf - BAWP_REF_LINES;
+   derive_bawp_parameters(xd, recon_top, recon_left, dst_stride, ref_top,
+--- a/av2/decoder/decodeframe.c
++++ b/av2/decoder/decodeframe.c
+@@ -75,6 +75,7 @@
+ #include "av2/decoder/decoder.h"
+ #include "av2/decoder/decodetxb.h"
+ #include "av2/decoder/detokenize.h"
++#include "av2/decoder/lf_pipeline.h"
+ #include "av2/decoder/obu.h"
+ 
+ #define AVM_MIN_THREADS_PER_TILE 1
+@@ -596,6 +597,7 @@
+     int use_optflow_refinement, uint16_t **mc_buf, uint16_t **pre,
+     SubpelParams *subpel_params, int *src_stride) {
+   if (inter_pred_params->use_ref_padding) {
++    assert(!inter_pred_params->is_intrabc || !xd->ibc_shadow);
+     common_calc_subpel_params_and_extend(
+         src_mv, inter_pred_params, xd, mi_x, mi_y, ref, use_optflow_refinement,
+         mc_buf, pre, subpel_params, src_stride);
+@@ -608,8 +610,16 @@
+   dec_calc_subpel_params(
+       src_mv, inter_pred_params, xd, mi_x, mi_y, pre, subpel_params, src_stride,
+       &block, use_optflow_refinement, &scaled_mv, &subpel_x_mv, &subpel_y_mv);
+-  extend_mc_border(inter_pred_params->scale_factors,
+-                   &inter_pred_params->ref_frame_buf, scaled_mv, block,
++  struct buf_2d ref_buf = inter_pred_params->ref_frame_buf;
++  if (inter_pred_params->is_intrabc) {
++    const ptrdiff_t d = av2_ibc_shadow_delta(
++        xd->ibc_shadow, ref_buf.buf0, block.y0, block.y1, mi_y,
++        inter_pred_params->subsampling_y, xd->tile.tile_col);
++    *pre += d;
++    ref_buf.buf += d;
++    ref_buf.buf0 += d;
++  }
++  extend_mc_border(inter_pred_params->scale_factors, &ref_buf, scaled_mv, block,
+                    subpel_x_mv, subpel_y_mv,
+                    inter_pred_params->mode == WARP_PRED,
+                    inter_pred_params->is_intrabc, mc_buf[ref], pre, src_stride);
+@@ -4623,6 +4633,7 @@
+ 
+   av2_zero_above_context(cm, xd, tile_info.mi_col_start, tile_info.mi_col_end,
+                          tile_row);
++  xd->ibc_shadow = av2_lf_pipeline_shadow(pbi->lf_pipe);
+ 
+   int num_filter_classes[MAX_MB_PLANE];
+   for (int p = 0; p < num_planes; ++p)
+@@ -4662,6 +4673,9 @@
+         return;
+       }
+     }
++    if (pbi->lf_pipe)
++      av2_lf_pipeline_row_done(pbi->lf_pipe, mi_row >> cm->mib_size_log2,
++                               tile_col);
+   }
+   int corrupted =
+       (cm->bru.frame_inactive_flag || cm->bridge_frame_info.is_bridge_frame) ? 0
+@@ -9856,6 +9870,12 @@
+       AVM_DEC_BORDER_IN_PIXELS, cm->features.byte_alignment, NULL, NULL, NULL,
+       false);
+ #endif  // CONFIG_INSPECTION
++  // A pipeline left by a decode that bailed out by longjmp is finished first.
++  av2_lf_pipeline_finish(pbi->lf_pipe);
++  pbi->lf_pipe = (start_tile == 0 && end_tile == tiles->rows * tiles->cols - 1)
++                     ? av2_lf_pipeline_start(pbi)
++                     : NULL;
++  const int lf_pipelined = pbi->lf_pipe != NULL;
+   if (pbi->max_threads > 1 && pbi->row_mt)
+     *p_data_end =
+         decode_tiles_row_mt(pbi, data, data_end, start_tile, end_tile);
+@@ -9863,6 +9883,8 @@
+     *p_data_end = decode_tiles_mt(pbi, data, data_end, start_tile, end_tile);
+   else
+     *p_data_end = decode_tiles(pbi, data, data_end, start_tile, end_tile);
++  av2_lf_pipeline_finish(pbi->lf_pipe);
++  pbi->lf_pipe = NULL;
+ 
+   // If the bit stream is monochrome, set the U and V buffers to a constant.
+   if (num_planes < 3) {
+@@ -9913,8 +9935,8 @@
+   }
+ 
+   if (!cm->bru.frame_inactive_flag) {
+-    if (cm->lf.apply_deblocking_filter[0] ||
+-        cm->lf.apply_deblocking_filter[1]) {
++    if (!lf_pipelined && (cm->lf.apply_deblocking_filter[0] ||
++                          cm->lf.apply_deblocking_filter[1])) {
+       if (pbi->num_workers > 1) {
+         av2_loop_filter_frame_mt(&cm->cur_frame->buf, cm, &pbi->dcb.xd, 0,
+                                  num_planes, 0, pbi->tile_workers,
+--- a/av2/decoder/decoder.c
++++ b/av2/decoder/decoder.c
+@@ -41,6 +41,7 @@
+ #include "av2/decoder/decodeframe.h"
+ #include "av2/decoder/decoder.h"
+ #include "av2/decoder/detokenize.h"
++#include "av2/decoder/lf_pipeline.h"
+ #include "av2/decoder/obu.h"
+ 
+ #if CONFIG_PARAKIT_COLLECT_DATA
+@@ -392,6 +393,9 @@
+   int i;
+ 
+   if (!pbi) return;
++
++  av2_lf_pipeline_finish(pbi->lf_pipe);
++  pbi->lf_pipe = NULL;
+ 
+   avm_get_worker_interface()->end(&pbi->lf_worker);
+   avm_free(pbi->lf_worker.data1);
+--- a/av2/decoder/decoder.h
++++ b/av2/decoder/decoder.h
+@@ -426,6 +426,10 @@
+   // or (2) depending on 'max_threads'.
+   unsigned int row_mt;
+ 
++  // Deblocking behind reconstruction for the frame being decoded, or NULL
++  // (lf_pipeline.c).
++  struct LfPipeline *lf_pipe;
++
+   // Coding block buffer for the current frame.
+   // Allocated and used only for multi-threaded decoding with 'row_mt == 0'.
+   // See also: similar buffer in 'ThreadData' struct.
+--- a/av2/decoder/lf_pipeline.c
++++ b/av2/decoder/lf_pipeline.c
+@@ -0,0 +1,337 @@
++/*
++ * Deblocking behind reconstruction.
++ *
++ * AVM deblocks a frame in one pass after every tile is decoded, so on a frame
++ * whose tiles finish unevenly the filter waits on the slowest tile. This file
++ * runs the same filter as a graph of small tasks that start as soon as the
++ * rows they touch can no longer change: per superblock row r and plane,
++ *
++ *   V(r)  the vertical edges of row r. It rewrites pixels of row r, which the
++ *         intra prediction of row r+1 reads unfiltered, so it waits until rows
++ *         r and r+1 are reconstructed in every tile column.
++ *   H(r)  the horizontal edges of row r. It rewrites the bottom lines of row
++ *         r-1 and the pixels of row r, after their vertical pass, so it waits
++ *         for V(r-1) and V(r). That is the same order the row-threaded
++ *         filter in av2/common/thread_common.c keeps, at row granularity.
++ *
++ * Each task calls AVM's own av2_filter_block_plane_vert/horz, so the output is
++ * bit-exact with the usual pass.
++ *
++ * IntraBC predicts from unfiltered pixels of the frame itself. Local IntraBC
++ * stays inside the current superblock row, and no task touches rows r-1 or r
++ * while row r is being decoded. Global IntraBC reaches any coded superblock
++ * above, so when a frame allows it each finished row of each tile column is
++ * also copied, by a task of its own, into an unfiltered shadow; V(r) waits for
++ * row r's copies, and reads that reach above row r-1 go to the shadow
++ * (IbcShadow in av2/common/blockd.h). AVM's level model already counts such a
++ * frame as twice the samples (av2/common/level.c).
++ *
++ * Inter frames and single-threaded decodes keep the usual pass.
++ * AVM_LF_PIPELINE=0 turns the pipeline off.
++ */
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "av2/common/av2_loopfilter.h"
++#include "av2/common/reconinter.h"
++#include "av2/decoder/decoder.h"
++#include "av2/decoder/lf_pipeline.h"
++#include "avm_mem/avm_mem.h"
++#include "avm_scale/yv12config.h"
++
++#if defined(__APPLE__)
++#include <dispatch/dispatch.h>
++#include <pthread.h>
++
++enum { LF_WAITING, LF_QUEUED, LF_DONE };
++
++typedef struct {
++  LfPipeline *p;
++  int dir, row, slot;
++} LfTask;
++
++typedef struct {
++  LfPipeline *p;
++  int row, tile_col;
++} LfCopy;
++
++struct LfPipeline {
++  IbcShadow shadow;  // first, so the wait callback can find the pipeline
++  AV2_COMMON *cm;
++  const MACROBLOCKD *xd;
++  YV12_BUFFER_CONFIG *frame;
++  MACROBLOCKD_PLANE tmpl[MAX_MB_PLANE];
++  int sb_rows, tile_cols;
++  int plane[MAX_MB_PLANE], nplanes;
++  pthread_mutex_t mu;
++  pthread_cond_t copied_cv;
++  int *recon;      // tile columns that finished each superblock row
++  uint8_t *state;  // per task, indexed by task_index()
++  LfTask *tasks;
++  dispatch_group_t group;
++  dispatch_queue_t queue;
++  // The shadow, when the frame allows global IntraBC.
++  int has_shadow;
++  uint8_t *shadow_alloc;  // the frame's allocation, mirrored
++  uint8_t *unit_copied;   // per (row, tile column)
++  int *row_copied;        // tile columns copied, per row
++  LfCopy *copies;
++};
++
++static int task_index(const LfPipeline *p, int dir, int row, int slot) {
++  return (dir * p->sb_rows + row) * p->nplanes + slot;
++}
++
++static int row_built(const LfPipeline *p, int row) {
++  return row >= p->sb_rows || p->recon[row] == p->tile_cols;
++}
++
++static int task_ready(const LfPipeline *p, int dir, int row, int slot) {
++  if (dir == 0)
++    return row_built(p, row) && row_built(p, row + 1) &&
++           (!p->has_shadow || p->row_copied[row] == p->tile_cols);
++  return p->state[task_index(p, 0, row, slot)] == LF_DONE &&
++         (row == 0 || p->state[task_index(p, 0, row - 1, slot)] == LF_DONE);
++}
++
++static void run_task(void *arg);
++
++// Caller holds p->mu.
++static void try_queue(LfPipeline *p, int dir, int row, int slot) {
++  if (row < 0 || row >= p->sb_rows) return;
++  const int i = task_index(p, dir, row, slot);
++  if (p->state[i] != LF_WAITING || !task_ready(p, dir, row, slot)) return;
++  p->state[i] = LF_QUEUED;
++  dispatch_group_async_f(p->group, p->queue, &p->tasks[i], run_task);
++}
++
++static void run_task(void *arg) {
++  const LfTask *t = (const LfTask *)arg;
++  LfPipeline *p = t->p;
++  AV2_COMMON *const cm = p->cm;
++  const int plane = p->plane[t->slot];
++  const int mi_row = t->row << cm->mib_size_log2;
++  MACROBLOCKD_PLANE planes[MAX_MB_PLANE];
++  memcpy(planes, p->tmpl, sizeof(planes));
++  for (int mi_col = 0; mi_col < cm->mi_params.mi_cols; mi_col += cm->mib_size) {
++    av2_setup_dst_planes(planes, p->frame, mi_row, mi_col, plane, plane + 1,
++                         NULL);
++    if (t->dir == 0)
++      av2_filter_block_plane_vert(cm, p->xd, plane, &planes[plane], mi_row,
++                                  mi_col);
++    else
++      av2_filter_block_plane_horz(cm, p->xd, plane, &planes[plane], mi_row,
++                                  mi_col);
++  }
++  pthread_mutex_lock(&p->mu);
++  p->state[task_index(p, t->dir, t->row, t->slot)] = LF_DONE;
++  if (t->dir == 0) {
++    try_queue(p, 1, t->row, t->slot);
++    try_queue(p, 1, t->row + 1, t->slot);
++  }
++  pthread_mutex_unlock(&p->mu);
++}
++
++// Caller holds p->mu. Marks one (row, tile column) copied, at most once.
++static void mark_copied(LfPipeline *p, int row, int tile_col) {
++  uint8_t *u = &p->unit_copied[row * p->tile_cols + tile_col];
++  if (*u) return;
++  *u = 1;
++  if (++p->row_copied[row] == p->tile_cols)
++    for (int slot = 0; slot < p->nplanes; slot++) try_queue(p, 0, row, slot);
++  pthread_cond_broadcast(&p->copied_cv);
++}
++
++// Copies one finished superblock row of one tile column into the shadow.
++static void run_copy(void *arg) {
++  const LfCopy *c = (const LfCopy *)arg;
++  LfPipeline *p = c->p;
++  const AV2_COMMON *const cm = p->cm;
++  const YV12_BUFFER_CONFIG *f = p->frame;
++  const int sb = MI_SIZE << cm->mib_size_log2;
++  const int x0_luma = cm->tiles.col_start_sb[c->tile_col] * sb;
++  const int x1_luma = cm->tiles.col_start_sb[c->tile_col + 1] * sb;
++  for (int i = 0; i < av2_num_planes(cm); i++) {
++    const int uv = i > 0;
++    const int ss_x = uv ? cm->seq_params.subsampling_x : 0;
++    const int ss_y = uv ? cm->seq_params.subsampling_y : 0;
++    const int x0 = x0_luma >> ss_x, y0 = (c->row * sb) >> ss_y;
++    const int w = AVMMIN(x1_luma >> ss_x, f->widths[uv]) - x0;
++    const int h = AVMMIN(sb >> ss_y, f->heights[uv] - y0);
++    const int stride = f->strides[uv];
++    const uint16_t *src = f->buffers[i] + (ptrdiff_t)y0 * stride + x0;
++    uint16_t *dst = (uint16_t *)src + p->shadow.delta[i];
++    for (int y = 0; y < h; y++)
++      memcpy(dst + (ptrdiff_t)y * stride, src + (ptrdiff_t)y * stride,
++             w * sizeof(*src));
++  }
++  pthread_mutex_lock(&p->mu);
++  mark_copied(p, c->row, c->tile_col);
++  pthread_mutex_unlock(&p->mu);
++}
++
++// IbcShadow.wait: an IntraBC read waits for the rows it reads to be copied.
++// They finished decoding a row or more ago, so this rarely blocks.
++static void wait_copied(const IbcShadow *s, int first, int last,
++                        int tile_col) {
++  LfPipeline *p = (LfPipeline *)s;
++  pthread_mutex_lock(&p->mu);
++  for (int row = first; row <= last; row++)
++    while (!p->unit_copied[row * p->tile_cols + tile_col])
++      pthread_cond_wait(&p->copied_cv, &p->mu);
++  pthread_mutex_unlock(&p->mu);
++}
++
++static void free_pipeline(LfPipeline *p) {
++  free(p->recon);
++  free(p->state);
++  free(p->tasks);
++  free(p->unit_copied);
++  free(p->row_copied);
++  free(p->copies);
++  avm_free(p->shadow_alloc);
++  free(p);
++}
++
++LfPipeline *av2_lf_pipeline_start(AV2Decoder *pbi) {
++  AV2_COMMON *const cm = &pbi->common;
++  const char *env = getenv("AVM_LF_PIPELINE");
++  if (env && env[0] == '0') return NULL;
++#if CONFIG_INSPECTION || CONFIG_MISMATCH_DEBUG
++  return NULL;
++#endif
++  if (pbi->max_threads <= 1 || pbi->row_mt) return NULL;
++  if (!frame_is_intra_only(cm)) return NULL;
++  if (cm->bru.enabled || cm->bridge_frame_info.is_bridge_frame) return NULL;
++  if (!cm->lf.apply_deblocking_filter[0] && !cm->lf.apply_deblocking_filter[1])
++    return NULL;
++
++  LfPipeline *p = (LfPipeline *)calloc(1, sizeof(*p));
++  if (!p) return NULL;
++  p->cm = cm;
++  p->xd = &pbi->dcb.xd;
++  p->frame = &cm->cur_frame->buf;
++  const int num_planes = av2_num_planes(cm);
++  for (int i = 0; i < num_planes; i++) {
++    const struct macroblockd_plane *pd = &pbi->dcb.xd.plane[i];
++    memcpy(&p->tmpl[i].dst, &pd->dst, sizeof(pd->dst));
++    p->tmpl[i].subsampling_x = pd->subsampling_x;
++    p->tmpl[i].subsampling_y = pd->subsampling_y;
++    // The same planes, in the same order, that thread_common.c enqueues.
++    if (i == 1 && !cm->lf.apply_deblocking_filter_u) continue;
++    if (i == 2 && !cm->lf.apply_deblocking_filter_v) continue;
++    p->plane[p->nplanes++] = i;
++  }
++  p->sb_rows = ALIGN_POWER_OF_TWO(cm->mi_params.mi_rows, cm->mib_size_log2) >>
++               cm->mib_size_log2;
++  p->tile_cols = cm->tiles.cols;
++  const int ntasks = 2 * p->sb_rows * p->nplanes;
++  const int nunits = p->sb_rows * p->tile_cols;
++  p->recon = (int *)calloc(p->sb_rows, sizeof(*p->recon));
++  p->state = (uint8_t *)calloc(ntasks, 1);
++  p->tasks = (LfTask *)calloc(ntasks, sizeof(*p->tasks));
++  if (!p->recon || !p->state || !p->tasks) {
++    free_pipeline(p);
++    return NULL;
++  }
++  for (int dir = 0; dir < 2; dir++)
++    for (int row = 0; row < p->sb_rows; row++)
++      for (int slot = 0; slot < p->nplanes; slot++)
++        p->tasks[task_index(p, dir, row, slot)] =
++            (LfTask){ p, dir, row, slot };
++  if (cm->features.allow_global_intrabc) {
++    // The shadow mirrors the frame's allocation byte for byte, so one offset
++    // maps any pixel. It is never cleared: a read only reaches rows already
++    // copied, and zeroing 20+ MB here would cost more than the pipeline saves.
++    const YV12_BUFFER_CONFIG *f = p->frame;
++    p->shadow_alloc = (uint8_t *)avm_memalign(32, f->frame_size);
++    p->unit_copied = (uint8_t *)calloc(nunits, 1);
++    p->row_copied = (int *)calloc(p->sb_rows, sizeof(*p->row_copied));
++    p->copies = (LfCopy *)calloc(nunits, sizeof(*p->copies));
++    if (!p->shadow_alloc || !p->unit_copied || !p->row_copied || !p->copies) {
++      free_pipeline(p);
++      return NULL;
++    }
++    for (int row = 0; row < p->sb_rows; row++)
++      for (int tc = 0; tc < p->tile_cols; tc++)
++        p->copies[row * p->tile_cols + tc] = (LfCopy){ p, row, tc };
++    p->has_shadow = 1;
++    const ptrdiff_t bytes =
++        (ptrdiff_t)((intptr_t)p->shadow_alloc - (intptr_t)f->buffer_alloc);
++    for (int i = 0; i < MAX_MB_PLANE; i++) {
++      p->shadow.live[i] = i < num_planes ? f->buffers[i] : NULL;
++      p->shadow.delta[i] =
++          i < num_planes ? bytes / (ptrdiff_t)sizeof(*f->buffers[i]) : 0;
++    }
++    p->shadow.sb_size_log2 = cm->mib_size_log2 + MI_SIZE_LOG2;
++    p->shadow.wait = wait_copied;
++  }
++  pthread_mutex_init(&p->mu, NULL);
++  pthread_cond_init(&p->copied_cv, NULL);
++  p->group = dispatch_group_create();
++  p->queue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
++  av2_loop_filter_frame_init(cm, 0, num_planes);
++  return p;
++}
++
++void av2_lf_pipeline_row_done(LfPipeline *p, int sb_row, int tile_col) {
++  pthread_mutex_lock(&p->mu);
++  if (p->has_shadow)
++    dispatch_group_async_f(p->group, p->queue,
++                           &p->copies[sb_row * p->tile_cols + tile_col],
++                           run_copy);
++  if (p->recon[sb_row] < p->tile_cols && ++p->recon[sb_row] == p->tile_cols) {
++    for (int slot = 0; slot < p->nplanes; slot++) {
++      try_queue(p, 0, sb_row - 1, slot);
++      try_queue(p, 0, sb_row, slot);
++    }
++  }
++  pthread_mutex_unlock(&p->mu);
++}
++
++const IbcShadow *av2_lf_pipeline_shadow(const LfPipeline *p) {
++  return p && p->has_shadow ? &p->shadow : NULL;
++}
++
++void av2_lf_pipeline_finish(LfPipeline *p) {
++  if (!p) return;
++  // A tile that stopped early (a corrupt stream) never reports its rows.
++  // Release them so every task runs and the wait below returns. Their shadow
++  // copies are never made; nothing reads the shadow after decoding.
++  pthread_mutex_lock(&p->mu);
++  for (int row = 0; row < p->sb_rows; row++) {
++    if (p->recon[row] == p->tile_cols) continue;
++    p->recon[row] = p->tile_cols;
++    if (p->has_shadow)
++      for (int tc = 0; tc < p->tile_cols; tc++) mark_copied(p, row, tc);
++  }
++  for (int row = 0; row < p->sb_rows; row++)
++    for (int slot = 0; slot < p->nplanes; slot++) try_queue(p, 0, row, slot);
++  pthread_mutex_unlock(&p->mu);
++  dispatch_group_wait(p->group, DISPATCH_TIME_FOREVER);
++  dispatch_release(p->group);
++  pthread_cond_destroy(&p->copied_cv);
++  pthread_mutex_destroy(&p->mu);
++  free_pipeline(p);
++}
++
++#else  // !__APPLE__
++
++LfPipeline *av2_lf_pipeline_start(AV2Decoder *pbi) {
++  (void)pbi;
++  return NULL;
++}
++void av2_lf_pipeline_row_done(LfPipeline *p, int sb_row, int tile_col) {
++  (void)p;
++  (void)sb_row;
++  (void)tile_col;
++}
++const IbcShadow *av2_lf_pipeline_shadow(const LfPipeline *p) {
++  (void)p;
++  return NULL;
++}
++void av2_lf_pipeline_finish(LfPipeline *p) { (void)p; }
++
++#endif  // __APPLE__
+--- a/av2/decoder/lf_pipeline.h
++++ b/av2/decoder/lf_pipeline.h
+@@ -0,0 +1,28 @@
++/*
++ * Deblocking behind reconstruction: the frame's deblocking filter runs on
++ * superblock rows while the tiles below them are still being decoded, instead
++ * of as one pass after the last tile. See lf_pipeline.c.
++ */
++#ifndef AVM_AV2_DECODER_LF_PIPELINE_H_
++#define AVM_AV2_DECODER_LF_PIPELINE_H_
++
++#include "av2/common/blockd.h"
++
++struct AV2Decoder;
++typedef struct LfPipeline LfPipeline;
++
++// Starts a pipeline for the frame about to be decoded, or returns NULL when
++// this frame must deblock the usual way. Call after setup_frame_info().
++LfPipeline *av2_lf_pipeline_start(struct AV2Decoder *pbi);
++
++// Tile column tile_col finished reconstructing superblock row sb_row.
++// Thread safe.
++void av2_lf_pipeline_row_done(LfPipeline *p, int sb_row, int tile_col);
++
++// The unfiltered copy IntraBC reads from, or NULL (also for p == NULL).
++const IbcShadow *av2_lf_pipeline_shadow(const LfPipeline *p);
++
++// Treats every row as reconstructed, waits for all deblocking, and frees p.
++void av2_lf_pipeline_finish(LfPipeline *p);
++
++#endif  // AVM_AV2_DECODER_LF_PIPELINE_H_

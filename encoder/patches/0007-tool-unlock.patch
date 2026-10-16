@@ -1,0 +1,132 @@
+diff --avm
+--- a/av2/arg_defs.c	2026-10-14 14:47:25
++++ b/av2/arg_defs.c	2026-10-14 14:50:10
+@@ -552,6 +552,12 @@
+   .qmseg_unit = ARG_DEF(NULL, "qmseg-unit", 1,
+                         "Classification unit in pixels: 16, 32, 64 or 128 "
+                         "(default 64)"),
++  .tool_unlock = ARG_DEF(NULL, "tool-unlock", 1,
++                         "Turn back on tools that the speed level or libavif "
++                         "switches off, a bitmask: 1 3-way and uneven 4-way "
++                         "partitions, 2 IST and CCTX search, 4 TCQ, 8 parity "
++                         "hiding, 16 loop restoration, 32 every intra mode at "
++                         "every transform size, 64 DIP (default 0)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h	2026-10-14 14:47:25
++++ b/av2/arg_defs.h	2026-10-14 14:50:10
+@@ -195,6 +195,7 @@
+   arg_def_t qmseg_thresh;
+   arg_def_t qmseg_level;
+   arg_def_t qmseg_unit;
++  arg_def_t tool_unlock;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c	2026-10-14 14:47:25
++++ b/av2/av2_cx_iface.c	2026-10-14 14:50:10
+@@ -261,6 +261,7 @@
+   int qmseg_thresh;
+   int qmseg_level;
+   int qmseg_unit;
++  int tool_unlock;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -606,6 +607,7 @@
+   45,     // qmseg_thresh
+   15,     // qmseg_level
+   64,     // qmseg_unit
++  0,      // tool_unlock
+ };
+ // clang-format on
+ 
+@@ -1512,6 +1514,7 @@
+                       : extra_cfg->qmseg_unit <= 32 ? 32
+                       : extra_cfg->qmseg_unit <= 64 ? 64
+                                                     : 128;
++  q_cfg->tool_unlock = extra_cfg->tool_unlock & 127;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4146,6 +4149,9 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg_unit,
+                                   argv, err_string)) {
+     extra_cfg.qmseg_unit = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.tool_unlock,
++                                  argv, err_string)) {
++    extra_cfg.tool_unlock = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.aq_mode, argv,
+                                   err_string)) {
+     extra_cfg.aq_mode = avm_arg_parse_uint_helper(&arg, err_string);
+@@ -4214,6 +4220,7 @@
+                  argv, err_string)) {
+     extra_cfg.enable_uneven_4way_partitions =
+         avm_arg_parse_int_helper(&arg, err_string);
++    if (extra_cfg.tool_unlock & 1) extra_cfg.enable_uneven_4way_partitions = 1;
+   } else if (avm_arg_match_helper(
+                  &arg,
+                  &g_av2_codec_arg_defs.disable_ml_partition_speed_features,
+@@ -4232,6 +4239,7 @@
+                                   argv, err_string)) {
+     extra_cfg.enable_ext_partitions =
+         avm_arg_parse_int_helper(&arg, err_string);
++    if (extra_cfg.tool_unlock & 1) extra_cfg.enable_ext_partitions = 1;
+   } else if (avm_arg_match_helper(&arg,
+                                   &g_av2_codec_arg_defs.enable_tx_partition,
+                                   argv, err_string)) {
+diff --avm
+--- a/av2/encoder/encoder.h	2026-10-14 14:47:25
++++ b/av2/encoder/encoder.h	2026-10-14 14:50:10
+@@ -790,6 +790,8 @@
+   int qmseg_thresh;
+   int qmseg_level;
+   int qmseg_unit;
++  // tool-unlock bitmask (patches/0007), measurement only.
++  int tool_unlock;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used
+diff --avm
+--- a/av2/encoder/speed_features.c	2026-09-26 21:29:57
++++ b/av2/encoder/speed_features.c	2026-10-14 14:50:10
+@@ -1041,6 +1041,23 @@
+   if (oxcf->mode == GOOD)
+     set_good_speed_features_framesize_independent(cpi, sf, speed);
+ 
++  // tool-unlock (patches/0007): turn back on what the speed level switched
++  // off, one tool per bit, so each can be measured on its own.
++  const int unlock = oxcf->q_cfg.tool_unlock;
++  if (unlock & 2) {
++    sf->tx_sf.tx_type_search.skip_stx_search = 0;
++    sf->tx_sf.tx_type_search.skip_cctx_search = 0;
++  }
++  if (unlock & 4) sf->rd_sf.disable_tcq = 0;
++  if (unlock & 16) sf->lpf_sf.disable_lr_filter = 0;
++  if (unlock & 32) {
++    for (i = 0; i < TX_SIZES; i++) {
++      sf->intra_sf.intra_y_mode_mask[i] = INTRA_ALL;
++      sf->intra_sf.intra_uv_mode_mask[i] = UV_INTRA_ALL;
++    }
++  }
++  if (unlock & 64) sf->intra_sf.skip_intra_dip_search = false;
++
+   if (!cpi->seq_params_locked) {
+     cpi->common.seq_params.enable_restoration &= !sf->lpf_sf.disable_lr_filter;
+ 
+@@ -1057,6 +1074,12 @@
+     if (sf->rd_sf.disable_tcq) {
+       cpi->common.seq_params.enable_tcq = TCQ_DISABLE;
+       cpi->common.features.tcq_mode = TCQ_DISABLE;
++    }
++    if ((unlock & 8) &&
++        cpi->common.seq_params.enable_tcq == TCQ_DISABLE &&
++        !is_lossless_requested(&oxcf->rc_cfg)) {
++      cpi->common.seq_params.enable_parity_hiding =
++          oxcf->tool_cfg.enable_parity_hiding;
+     }
+   }
+ 
