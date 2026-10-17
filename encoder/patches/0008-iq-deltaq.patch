@@ -1,0 +1,257 @@
+diff --avm
+--- a/av2/arg_defs.c
++++ b/av2/arg_defs.c
+@@ -558,6 +558,10 @@ const av2_codec_arg_definitions_t g_av2_codec_arg_defs = {
+                          "partitions, 2 IST and CCTX search, 4 TCQ, 8 parity "
+                          "hiding, 16 loop restoration, 32 every intra mode at "
+                          "every transform size, 64 DIP (default 0)"),
++  .iq_deltaq = ARG_DEF(NULL, "iq-deltaq", 1,
++                       "Quantize DC and chroma the way libaom tune=iq does: "
++                       "finer DC than AC, coarser 4:4:4 chroma AC "
++                       "(0: off (default), 1: on)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h
++++ b/av2/arg_defs.h
+@@ -196,6 +196,7 @@ typedef struct av2_codec_arg_definitions {
+   arg_def_t qmseg_level;
+   arg_def_t qmseg_unit;
+   arg_def_t tool_unlock;
++  arg_def_t iq_deltaq;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c
++++ b/av2/av2_cx_iface.c
+@@ -262,6 +262,7 @@ struct av2_extracfg {
+   int qmseg_level;
+   int qmseg_unit;
+   int tool_unlock;
++  int iq_deltaq;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -608,6 +609,7 @@ static struct av2_extracfg default_extra_cfg = {
+   15,     // qmseg_level
+   64,     // qmseg_unit
+   0,      // tool_unlock
++  0,      // iq_deltaq
+ };
+ // clang-format on
+ 
+@@ -1515,6 +1517,7 @@ static avm_codec_err_t set_encoder_config(AV2EncoderConfig *oxcf,
+                       : extra_cfg->qmseg_unit <= 64 ? 64
+                                                     : 128;
+   q_cfg->tool_unlock = extra_cfg->tool_unlock & 127;
++  q_cfg->iq_deltaq = extra_cfg->iq_deltaq != 0;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -4149,6 +4152,9 @@ static avm_codec_err_t encoder_set_option(avm_codec_alg_priv_t *ctx,
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qmseg_unit,
+                                   argv, err_string)) {
+     extra_cfg.qmseg_unit = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.iq_deltaq,
++                                  argv, err_string)) {
++    extra_cfg.iq_deltaq = avm_arg_parse_int_helper(&arg, err_string);
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.tool_unlock,
+                                   argv, err_string)) {
+     extra_cfg.tool_unlock = avm_arg_parse_int_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/av2_quantize.c
++++ b/av2/encoder/av2_quantize.c
+@@ -426,8 +426,10 @@ void av2_init_plane_quantizers(const AV2_COMP *cpi, MACROBLOCK *x,
+   const int qindex = av2_get_qindex(&cm->seg, segment_id, current_qindex,
+                                     cm->seq_params.bit_depth);
+ 
+-  const int rdmult =
+-      av2_compute_rd_mult(cpi, qindex + quant_params->y_dc_delta_q);
++  // iq-deltaq's luma DC delta is a finer DC step, the way AV1's DC table is,
++  // so it leaves lambda on the AC qindex as libaom's does
++  const int rdmult = av2_compute_rd_mult(
++      cpi, qindex + (cpi->oxcf.q_cfg.iq_deltaq ? 0 : quant_params->y_dc_delta_q));
+   const int use_qmatrix = av2_use_qmatrix(quant_params, xd, segment_id);
+ 
+   // Y
+@@ -535,6 +537,112 @@ void set_frame_dc_delta_q(const AV2_COMMON *const cm, int *y_dc_delta_q,
+   *v_ac_delta_q = 0;
+ }
+ 
++// iq-deltaq: libaom's tune=iq quantizer balance for stills, on AV2's scale.
++//
++// The AV1 that AVIF ships quantizes DC more finely than AC: its DC table runs
++// under its AC table, from 0.89x the step at qindex 40 to 0.56x at 220. And
++// tune=iq (av1_set_quantizer, libaom 3.15.1) rebalances chroma: 4:4:4 chroma
++// AC goes up to 24 AV1 qindex coarser with chroma DC left alone, 4:2:2 chroma
++// AC up to 6 coarser, and 4:2:0 chroma up to 16 finer. AVM codes DC on its AC
++// table (equal_ac_dc_q) and its chroma-deltaq hook, set_frame_dc_delta_q(),
++// sets nothing, so an AV2 still has neither balance.
++//
++// Measured 2026-10-17 (av2-tone README): it does what it says, luma's coarse
++// error falls on 23 of 24 dense crops and chroma's rises on all 24, and
++// ssimulacra2 nets the trade to a tie at matched bytes. Off by default.
++//
++// This finds the AV1 qindex whose AC step matches this frame's AV2 AC step,
++// reads libaom's offsets there off libaom's own 8-bit tables, and writes each
++// step ratio as an AV2 frame-level qindex delta (24 per octave). The tables
++// are libaom's dc_qlookup_QTX and ac_qlookup_QTX, copied verbatim.
++static const int16_t iq_av1_dc_q8[256] = {
++  4, 8, 8, 9, 10, 11, 12, 12, 13, 14, 15, 16,
++  17, 18, 19, 19, 20, 21, 22, 23, 24, 25, 26, 26,
++  27, 28, 29, 30, 31, 32, 32, 33, 34, 35, 36, 37,
++  38, 38, 39, 40, 41, 42, 43, 43, 44, 45, 46, 47,
++  48, 48, 49, 50, 51, 52, 53, 53, 54, 55, 56, 57,
++  57, 58, 59, 60, 61, 62, 62, 63, 64, 65, 66, 66,
++  67, 68, 69, 70, 70, 71, 72, 73, 74, 74, 75, 76,
++  77, 78, 78, 79, 80, 81, 81, 82, 83, 84, 85, 85,
++  87, 88, 90, 92, 93, 95, 96, 98, 99, 101, 102, 104,
++  105, 107, 108, 110, 111, 113, 114, 116, 117, 118, 120, 121,
++  123, 125, 127, 129, 131, 134, 136, 138, 140, 142, 144, 146,
++  148, 150, 152, 154, 156, 158, 161, 164, 166, 169, 172, 174,
++  177, 180, 182, 185, 187, 190, 192, 195, 199, 202, 205, 208,
++  211, 214, 217, 220, 223, 226, 230, 233, 237, 240, 243, 247,
++  250, 253, 257, 261, 265, 269, 272, 276, 280, 284, 288, 292,
++  296, 300, 304, 309, 313, 317, 322, 326, 330, 335, 340, 344,
++  349, 354, 359, 364, 369, 374, 379, 384, 389, 395, 400, 406,
++  411, 417, 423, 429, 435, 441, 447, 454, 461, 467, 475, 482,
++  489, 497, 505, 513, 522, 530, 539, 549, 559, 569, 579, 590,
++  602, 614, 626, 640, 654, 668, 684, 700, 717, 736, 755, 775,
++  796, 819, 843, 869, 896, 925, 955, 988, 1022, 1058, 1098, 1139,
++  1184, 1232, 1282, 1336,
++};
++static const int16_t iq_av1_ac_q8[256] = {
++  4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
++  19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
++  31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
++  43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54,
++  55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66,
++  67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
++  79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
++  91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
++  104, 106, 108, 110, 112, 114, 116, 118, 120, 122, 124, 126,
++  128, 130, 132, 134, 136, 138, 140, 142, 144, 146, 148, 150,
++  152, 155, 158, 161, 164, 167, 170, 173, 176, 179, 182, 185,
++  188, 191, 194, 197, 200, 203, 207, 211, 215, 219, 223, 227,
++  231, 235, 239, 243, 247, 251, 255, 260, 265, 270, 275, 280,
++  285, 290, 295, 300, 305, 311, 317, 323, 329, 335, 341, 347,
++  353, 359, 366, 373, 380, 387, 394, 401, 408, 416, 424, 432,
++  440, 448, 456, 465, 474, 483, 492, 501, 510, 520, 530, 540,
++  550, 560, 571, 582, 593, 604, 615, 627, 639, 651, 663, 676,
++  689, 702, 715, 729, 743, 757, 771, 786, 801, 816, 832, 848,
++  864, 881, 898, 915, 933, 951, 969, 988, 1007, 1026, 1046, 1066,
++  1087, 1108, 1129, 1151, 1173, 1196, 1219, 1243, 1267, 1292, 1317, 1343,
++  1369, 1396, 1423, 1451, 1479, 1508, 1537, 1567, 1597, 1628, 1660, 1692,
++  1725, 1759, 1793, 1828,
++};
++
++// A step ratio as an AV2 qindex delta, inside the 6-bit frame delta_q syntax.
++static int iq_ratio_to_delta(double ratio) {
++  return clamp((int)lround(24.0 * log2(ratio)), -63, 63);
++}
++
++static void av2_iq_frame_delta_q(const AV2_COMMON *const cm,
++                                 CommonQuantParams *const quant_params) {
++  const int q = quant_params->base_qindex;
++  // lossless stays lossless, as libaom's "enable_chroma_deltaq && q" guard
++  if (q == 0) return;
++  const SequenceHeader *const seq = &cm->seq_params;
++  const int bd = (int)seq->bit_depth;
++  // AV2's AC step on AV1's 8-bit Q3 scale: AV2's tables carry QUANT_TABLE_BITS
++  // more fraction bits, and each bit of depth past 8 doubles the step.
++  const double step = (double)av2_ac_quant_QTX(q, 0, 0, seq->bit_depth) /
++                      (double)(1 << (QUANT_TABLE_BITS + (bd - 8)));
++  int q1 = 0;
++  while (q1 < 255 && iq_av1_ac_q8[q1 + 1] <= step) q1++;
++  if (q1 < 255 && step - iq_av1_ac_q8[q1] > iq_av1_ac_q8[q1 + 1] - step) q1++;
++  const double ac = iq_av1_ac_q8[q1];
++  const int dc = iq_ratio_to_delta(iq_av1_dc_q8[q1] / ac);
++  quant_params->y_dc_delta_q = dc;
++  if (av2_num_planes(cm) == 1) return;
++  int uv_dc = dc, uv_ac = 0;
++  if (seq->subsampling_x && seq->subsampling_y) {
++    const int x = clamp(q1 / 2 - 14, 0, 16);
++    uv_dc = iq_ratio_to_delta(iq_av1_dc_q8[AVMMAX(q1 - x, 0)] / ac);
++    uv_ac = iq_ratio_to_delta(iq_av1_ac_q8[AVMMAX(q1 - x, 0)] / ac);
++  } else if (seq->subsampling_x) {
++    uv_ac = iq_ratio_to_delta(
++        iq_av1_ac_q8[AVMMIN(q1 + AVMMIN(q1 / 2, 6), 255)] / ac);
++  } else {
++    uv_ac = iq_ratio_to_delta(
++        iq_av1_ac_q8[AVMMIN(q1 + AVMMIN(q1 / 2, 24), 255)] / ac);
++  }
++  quant_params->u_dc_delta_q = quant_params->v_dc_delta_q = uv_dc;
++  quant_params->u_ac_delta_q = quant_params->v_ac_delta_q = uv_ac;
++}
++
+ // A version of set_qm_params() used when the
+ // AV2E_SET_FRAME_MULTI_QMATRIX_UNIT_TEST codec control is set to a nonzero
+ // value. Only used in quantization matrix unit test.
+@@ -675,6 +783,7 @@ void av2_set_quantizer(AV2_COMP *const cpi, int min_qmlevel, int max_qmlevel,
+                        &quant_params->u_dc_delta_q, &quant_params->v_dc_delta_q,
+                        &quant_params->u_ac_delta_q,
+                        &quant_params->v_ac_delta_q);
++  if (cpi->oxcf.q_cfg.iq_deltaq) av2_iq_frame_delta_q(cm, quant_params);
+   cm->cur_frame->u_ac_delta_q = quant_params->u_ac_delta_q;
+   cm->cur_frame->v_ac_delta_q = quant_params->v_ac_delta_q;
+   if (cpi->oxcf.unit_test_cfg.frame_multi_qmatrix_unit_test == 0) {
+diff --avm
+--- a/av2/encoder/encodeframe_utils.c
++++ b/av2/encoder/encodeframe_utils.c
+@@ -24,8 +24,9 @@ static AVM_INLINE int set_deltaq_rdmult(const AV2_COMP *const cpi,
+                                         const MACROBLOCK *const x) {
+   const AV2_COMMON *const cm = &cpi->common;
+   const CommonQuantParams *quant_params = &cm->quant_params;
+-  return av2_compute_rd_mult(cpi, quant_params->base_qindex + x->delta_qindex +
+-                                      quant_params->y_dc_delta_q);
++  return av2_compute_rd_mult(
++      cpi, quant_params->base_qindex + x->delta_qindex +
++               (cpi->oxcf.q_cfg.iq_deltaq ? 0 : quant_params->y_dc_delta_q));
+ }
+ 
+ void av2_set_ssim_rdmult(const AV2_COMP *const cpi, MvCosts *const mv_costs,
+diff --avm
+--- a/av2/encoder/encoder.c
++++ b/av2/encoder/encoder.c
+@@ -674,6 +674,14 @@ void av2_init_seq_coding_tools(AV2_COMP *cpi, SequenceHeader *seq,
+           qc->base_uv_ac_delta_q, DELTA_DCQUANT_MIN, DELTA_DCQUANT_MAX);
+     }
+   }
++  if (oxcf->q_cfg.iq_deltaq) {
++    // iq-deltaq writes frame-level DC and chroma deltas (av2_iq_frame_delta_q
++    // in av2_quantize.c), which the sequence has to declare.
++    seq->equal_ac_dc_q = 0;
++    seq->y_dc_delta_q_enabled = 1;
++    seq->uv_dc_delta_q_enabled = 1;
++    seq->uv_ac_delta_q_enabled = 1;
++  }
+   assert(IMPLIES(seq->equal_ac_dc_q, seq->y_dc_delta_q_enabled == 0 &&
+                                          seq->base_y_dc_delta_q == 0));
+   assert(IMPLIES(seq->equal_ac_dc_q,
+diff --avm
+--- a/av2/encoder/encoder.h
++++ b/av2/encoder/encoder.h
+@@ -767,6 +767,8 @@ typedef struct {
+   DELTAQ_MODE deltaq_mode;
+   // Indicates if delta quantization should be enabled in chroma planes.
+   bool enable_chroma_deltaq;
++  // libaom tune=iq's DC and chroma quantizer balance, as frame-level deltas.
++  int iq_deltaq;
+   // Sequence-level DC / chroma qindex offsets, AV2 base_*_delta_q (-23..8).
+   int base_y_dc_delta_q;
+   int base_uv_dc_delta_q;
+diff --avm
+--- a/av2/encoder/rd.c
++++ b/av2/encoder/rd.c
+@@ -1306,7 +1306,8 @@ void av2_initialize_rd_consts(AV2_COMP *cpi) {
+   avm_clear_system_state();
+ 
+   rd->RDMULT = av2_compute_rd_mult(
+-      cpi, cm->quant_params.base_qindex + cm->quant_params.y_dc_delta_q);
++      cpi, cm->quant_params.base_qindex +
++               (cpi->oxcf.q_cfg.iq_deltaq ? 0 : cm->quant_params.y_dc_delta_q));
+ 
+   av2_set_error_per_bit(mv_costs, rd->RDMULT);
+ 

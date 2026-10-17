@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds seven encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds eight encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -59,6 +59,10 @@
 #                        or libavif switches off: 1 3-way and uneven 4-way
 #                        partitions, 2 IST/CCTX search, 4 TCQ, 8 parity hiding,
 #                        16 loop restoration, 32 every intra mode, 64 DIP
+#   0008 iq-deltaq       libaom tune=iq's quantizer balance as frame deltas: DC
+#                        finer than AC as AV1's DC table runs, 4:4:4 chroma AC
+#                        coarser, at the AV1 qindex with the same step. Measured
+#                        a tie on ssimulacra2 (README), so it stays off
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -194,4 +198,14 @@ cmp -s "$GATE/tuned.avif" "$GATE/unlock.avif" && {
 "$TUNED/avifdec" "$GATE/unlock.avif" "$GATE/unlock.tuned.y4m" >/dev/null
 cmp -s "$GATE/unlock.pristine.y4m" "$GATE/unlock.tuned.y4m" || {
   echo "error: the reference decoder reads a tool-unlock file differently" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off; qmseg and tool-unlock decode identically)"
+# 0008's iq-deltaq writes frame-level DC and chroma deltas the reference
+# encoder never sends: the stream must change, and the reference decoder must
+# read it as the tuned build does.
+"$TUNED/avifenc" "${BASE[@]}" -a iq-deltaq=1 "$IMG" "$GATE/iq.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/iq.avif" && {
+  echo "error: iq-deltaq=1 wrote the same bytes as no options" >&2; exit 1; }
+"$OUT/avifdec" "$GATE/iq.avif" "$GATE/iq.pristine.y4m" >/dev/null
+"$TUNED/avifdec" "$GATE/iq.avif" "$GATE/iq.tuned.y4m" >/dev/null
+cmp -s "$GATE/iq.pristine.y4m" "$GATE/iq.tuned.y4m" || {
+  echo "error: the reference decoder reads an iq-deltaq file differently" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically)"
