@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds nine encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds ten encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -67,6 +67,11 @@
 #                        multiplier curve with any map, and field-dump=<file>
 #                        writes that curve and the jpegli field, so block-level
 #                        perceptual weighting is decided outside AVM
+#   0010 seg-map         seg-map=<file>: a segment per 8x8 luma block, each with
+#                        a qindex delta and luma QM level (up to 16 segments
+#                        with enable-ext-seg, 4 QM sets), so block-level
+#                        quantization is decided outside AVM. Also fixes the
+#                        final encode keeping another segment's quantizer
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -235,4 +240,43 @@ st=$?
 set -e
 [ "$st" = 1 ] && grep -q "lambda-map: not a" "$GATE/wrong.log" || {
   echo "error: a lambda-map for the wrong grid was not refused cleanly (exit $st)" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips)"
+# 0010's seg-map. A map whose one segment changes nothing is no map (same
+# bytes). A split inside a superblock must decode as well as the same split on
+# a superblock edge: AVM's final encode kept the last RD candidate's quantizer,
+# so a block was quantized at another segment's qindex and signalled at its
+# own, about 10 dB down (the patch resets it, as AVM does for an AQ mode). The
+# reference decoder must read the file as the tuned build does, and a map for
+# the wrong grid must exit 1 with the reason.
+read -r W H < <(head -c 200 "$IMG" | head -1 | sed -E 's/.* W([0-9]+) H([0-9]+).*/\1 \2/')
+COLS=$(( (W + 7) / 8 )); ROWS=$(( (H + 7) / 8 ))
+segmap() {  # segmap <8x8 blocks in segment 0, from the left> <segment 1's qindex delta>
+  awk -v c="$COLS" -v r="$ROWS" -v s="$1" -v d="$2" 'BEGIN {
+    print "segmap", c, r
+    for (y = 0; y < r; y++) { l = ""; for (x = 0; x < c; x++) l = l (x < s ? 0 : 1) (x < c - 1 ? " " : ""); print l }
+    print "seg 0 0 -1"; if (d != "none") print "seg 1", d, -1 }'
+}
+segmap "$COLS" none > "$GATE/noop.map"
+"$TUNED/avifenc" "${BASE[@]}" -a seg-map="$GATE/noop.map" "$IMG" "$GATE/noop.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/noop.avif" || {
+  echo "error: a no-op seg-map changed the bytes" >&2; exit 1; }
+segmap 32 40 > "$GATE/edge.map"   # 256 px: a superblock edge at 64 and 128
+segmap 40 40 > "$GATE/mid.map"    # 320 px: inside a superblock either way
+for m in edge mid; do
+  "$TUNED/avifenc" "${BASE[@]}" -a seg-map="$GATE/$m.map" "$IMG" "$GATE/$m.avif" >/dev/null
+  "$OUT/avifdec" "$GATE/$m.avif" "$GATE/$m.pristine.y4m" >/dev/null
+done
+"$TUNED/avifdec" "$GATE/mid.avif" "$GATE/mid.tuned.y4m" >/dev/null
+cmp -s "$GATE/mid.pristine.y4m" "$GATE/mid.tuned.y4m" || {
+  echo "error: the reference decoder reads a seg-map file differently" >&2; exit 1; }
+EDGE=$(bun "$SCRIPT_DIR/psnr.ts" "$IMG" "$GATE/edge.pristine.y4m")
+MID=$(bun "$SCRIPT_DIR/psnr.ts" "$IMG" "$GATE/mid.pristine.y4m")
+awk -v e="$EDGE" -v m="$MID" 'BEGIN { exit !(m > e - 2) }' || {
+  echo "error: a seg-map split inside a superblock decodes at $MID dB against $EDGE dB on its edge" >&2; exit 1; }
+printf 'segmap 1 1\n0\nseg 0 0 -1\n' > "$GATE/wrongseg.map"
+set +e
+"$TUNED/avifenc" "${BASE[@]}" -a seg-map="$GATE/wrongseg.map" "$IMG" "$GATE/wrongseg.avif" >"$GATE/wrongseg.log" 2>&1
+st=$?
+set -e
+[ "$st" = 1 ] && grep -q "seg-map: not a" "$GATE/wrongseg.log" || {
+  echo "error: a seg-map for the wrong grid was not refused cleanly (exit $st)" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips; seg-map decodes inside superblocks)"
