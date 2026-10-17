@@ -13,7 +13,7 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: eight encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: nine encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
 | `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |

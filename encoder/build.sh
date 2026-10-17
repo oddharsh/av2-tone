@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds eight encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds nine encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -63,6 +63,10 @@
 #                        finer than AC as AV1's DC table runs, 4:4:4 chroma AC
 #                        coarser, at the AV1 qindex with the same step. Measured
 #                        a tie on ssimulacra2 (README), so it stays off
+#   0009 lambda-map      lambda-map=<file> replaces tune=ssim's per-16x16 RD
+#                        multiplier curve with any map, and field-dump=<file>
+#                        writes that curve and the jpegli field, so block-level
+#                        perceptual weighting is decided outside AVM
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -208,4 +212,27 @@ cmp -s "$GATE/tuned.avif" "$GATE/iq.avif" && {
 "$TUNED/avifdec" "$GATE/iq.avif" "$GATE/iq.tuned.y4m" >/dev/null
 cmp -s "$GATE/iq.pristine.y4m" "$GATE/iq.tuned.y4m" || {
   echo "error: the reference decoder reads an iq-deltaq file differently" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically)"
+# 0009's field-dump must not touch the stream; its tune=ssim grid, read back
+# as a lambda-map, must give the same bytes (the path is exact); a flat map
+# must change them; and a map for the wrong grid must fail, never fall back.
+"$TUNED/avifenc" "${BASE[@]}" -a field-dump="$GATE/fields.txt" "$IMG" "$GATE/dump.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/dump.avif" || {
+  echo "error: field-dump changed the bytes" >&2; exit 1; }
+grep -q '^jpegli ' "$GATE/fields.txt" || { echo "error: field-dump wrote no jpegli field" >&2; exit 1; }
+awk '/^jpegli /{exit} /^ssim /{$1="lambda"} {print}' "$GATE/fields.txt" > "$GATE/ssim.map"
+"$TUNED/avifenc" "${BASE[@]}" -a lambda-map="$GATE/ssim.map" "$IMG" "$GATE/roundtrip.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/roundtrip.avif" || {
+  echo "error: tune=ssim's own grid as a lambda-map changed the bytes" >&2; exit 1; }
+awk 'NR==1{print; next} {for (i = 1; i <= NF; i++) $i = 1; print}' "$GATE/ssim.map" > "$GATE/flat.map"
+"$TUNED/avifenc" "${BASE[@]}" -a lambda-map="$GATE/flat.map" "$IMG" "$GATE/flat.avif" >/dev/null
+cmp -s "$GATE/tuned.avif" "$GATE/flat.avif" && {
+  echo "error: a flat lambda-map wrote the same bytes as tune=ssim" >&2; exit 1; }
+# Refused means exit 1 with the reason, so a crash can't pass for a refusal.
+printf 'lambda 1 1\n1\n' > "$GATE/wrong.map"
+set +e
+"$TUNED/avifenc" "${BASE[@]}" -a lambda-map="$GATE/wrong.map" "$IMG" "$GATE/wrong.avif" >"$GATE/wrong.log" 2>&1
+st=$?
+set -e
+[ "$st" = 1 ] && grep -q "lambda-map: not a" "$GATE/wrong.log" || {
+  echo "error: a lambda-map for the wrong grid was not refused cleanly (exit $st)" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips)"

@@ -1,0 +1,227 @@
+diff --avm
+--- a/av2/arg_defs.c
++++ b/av2/arg_defs.c
+@@ -562,6 +562,13 @@
+                        "Quantize DC and chroma the way libaom tune=iq does: "
+                        "finer DC than AC, coarser 4:4:4 chroma AC "
+                        "(0: off (default), 1: on)"),
++  .lambda_map = ARG_DEF(NULL, "lambda-map", 1,
++                        "Text file of per-16x16 RD multiplier scales that "
++                        "replaces tune=ssim's variance curve; renormalized "
++                        "to a geometric mean of 1 (default none)"),
++  .field_dump = ARG_DEF(NULL, "field-dump", 1,
++                        "Write tune=ssim's 16x16 scales and the jpegli 8x8 "
++                        "masking field to this text file (default none)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h
++++ b/av2/arg_defs.h
+@@ -197,6 +197,8 @@
+   arg_def_t qmseg_unit;
+   arg_def_t tool_unlock;
+   arg_def_t iq_deltaq;
++  arg_def_t lambda_map;
++  arg_def_t field_dump;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c
++++ b/av2/av2_cx_iface.c
+@@ -10,6 +10,7 @@
+  * aomedia.org/license/patent-license/.
+  */
+ #include <assert.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -263,6 +264,8 @@
+   int qmseg_unit;
+   int tool_unlock;
+   int iq_deltaq;
++  const char *lambda_map;
++  const char *field_dump;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -610,6 +613,8 @@
+   64,     // qmseg_unit
+   0,      // tool_unlock
+   0,      // iq_deltaq
++  NULL,   // lambda_map
++  NULL,   // field_dump
+ };
+ // clang-format on
+ 
+@@ -894,6 +899,35 @@
+   return AVM_CODEC_OK;
+ }
+ 
++// lambda-map / field-dump (patches/0009), checked before the frame starts:
++// an error raised mid-frame crashes AVM's multithreaded teardown, so a bad map
++// is refused here, by the API call, instead.
++static avm_codec_err_t validate_lambda_map(avm_codec_alg_priv_t *ctx,
++                                           const avm_image_t *img) {
++  const struct av2_extracfg *const cfg = &ctx->extra_cfg;
++  if (!cfg->lambda_map && !cfg->field_dump) return AVM_CODEC_OK;
++  if (cfg->tuning != AVM_TUNE_SSIM)
++    ERROR("lambda-map and field-dump need tune=ssim");
++  if (!cfg->lambda_map) return AVM_CODEC_OK;
++  // The 16x16 grid av2_set_mb_ssim_rdmult_scaling walks: 4x4 mi units over
++  // the frame padded to 8 pixels.
++  const int cols = ((((int)img->d_w + 7) & ~7) / 4 + 3) / 4;
++  const int rows = ((((int)img->d_h + 7) & ~7) / 4 + 3) / 4;
++  FILE *f = fopen(cfg->lambda_map, "r");
++  if (!f) ERROR("lambda-map: cannot open the file");
++  int w = 0, h = 0, ok = fscanf(f, " lambda %d %d", &w, &h) == 2;
++  ok = ok && w == cols && h == rows;
++  for (int i = 0; ok && i < cols * rows; ++i) {
++    double v = 0.0;
++    ok = fscanf(f, "%lf", &v) == 1 && v > 0.0;
++  }
++  fclose(f);
++  if (!ok)
++    ERROR("lambda-map: not a 'lambda <cols> <rows>' map of positive scales "
++          "for this frame's 16x16 grid");
++  return AVM_CODEC_OK;
++}
++
+ static avm_codec_err_t validate_img(avm_codec_alg_priv_t *ctx,
+                                     const avm_image_t *img) {
+ #if CONFIG_TESTONLY_12BIT_SUPPORT
+@@ -1518,6 +1552,8 @@
+                                                     : 128;
+   q_cfg->tool_unlock = extra_cfg->tool_unlock & 127;
+   q_cfg->iq_deltaq = extra_cfg->iq_deltaq != 0;
++  q_cfg->lambda_map = extra_cfg->lambda_map;
++  q_cfg->field_dump = extra_cfg->field_dump;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -3234,6 +3270,7 @@
+ 
+   if (img != NULL) {
+     res = validate_img(ctx, img);
++    if (res == AVM_CODEC_OK) res = validate_lambda_map(ctx, img);
+     // TODO(jzern) the checks related to cpi's validity should be treated as a
+     // failure condition, encoder setup is done fully in init() currently.
+     if (res == AVM_CODEC_OK) {
+@@ -4155,6 +4192,12 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.iq_deltaq,
+                                   argv, err_string)) {
+     extra_cfg.iq_deltaq = avm_arg_parse_int_helper(&arg, err_string);
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.lambda_map,
++                                  argv, err_string)) {
++    extra_cfg.lambda_map = value;
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.field_dump,
++                                  argv, err_string)) {
++    extra_cfg.field_dump = value;
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.tool_unlock,
+                                   argv, err_string)) {
+     extra_cfg.tool_unlock = avm_arg_parse_int_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/encoder.c
++++ b/av2/encoder/encoder.c
+@@ -4882,6 +4882,12 @@
+     }
+   }
+ 
++  // lambda-map and field-dump ride on tune=ssim's per-block scaling
++  // (patches/0009), so without it they would do nothing, silently.
++  if ((oxcf->q_cfg.lambda_map || oxcf->q_cfg.field_dump) &&
++      oxcf->tune_cfg.tuning != AVM_TUNE_SSIM)
++    avm_internal_error(&cpi->common.error, AVM_CODEC_INVALID_PARAM,
++                       "lambda-map and field-dump need tune=ssim");
+   if (oxcf->tune_cfg.tuning == AVM_TUNE_SSIM)
+     av2_set_mb_ssim_rdmult_scaling(cpi);
+ 
+diff --avm
+--- a/av2/encoder/encoder.h
++++ b/av2/encoder/encoder.h
+@@ -794,6 +794,9 @@
+   int qmseg_unit;
+   // tool-unlock bitmask (patches/0007), measurement only.
+   int tool_unlock;
++  // lambda-map / field-dump (patches/0009): file paths, or NULL.
++  const char *lambda_map;
++  const char *field_dump;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used
+diff --avm
+--- a/av2/encoder/encoder_utils.c
++++ b/av2/encoder/encoder_utils.c
+@@ -10,8 +10,11 @@
+  * aomedia.org/license/patent-license/.
+  */
+ 
++#include <stdio.h>
++
+ #include "avm_ports/system_state.h"
+ 
++#include "av2/encoder/aq_variance.h"
+ #include "av2/encoder/bitstream.h"
+ #include "av2/encoder/encodeframe.h"
+ #include "av2/encoder/encoder.h"
+@@ -1124,6 +1127,58 @@
+       cpi->ssim_rdmult_scaling_factors[index] /= log_sum;
+     }
+   }
++
++  // lambda-map / field-dump (patches/0009). The dump comes first, so it
++  // always holds tune=ssim's own scales; a map then replaces them.
++  const QuantizationCfg *const q_cfg = &cpi->oxcf.q_cfg;
++  if (q_cfg->field_dump) {
++    FILE *f = fopen(q_cfg->field_dump, "w");
++    if (!f)
++      avm_internal_error(&cpi->common.error, AVM_CODEC_INVALID_PARAM,
++                         "field-dump: cannot write %s", q_cfg->field_dump);
++    fprintf(f, "ssim %d %d\n", num_cols, num_rows);
++    for (int i = 0; i < num_rows * num_cols; ++i)
++      fprintf(f, "%.9g%c", cpi->ssim_rdmult_scaling_factors[i],
++              (i + 1) % num_cols ? ' ' : '\n');
++    av2_jpegli_mask_frame(cpi);
++    if (cpi->jm_qf) {
++      fprintf(f, "jpegli %d %d\n", cpi->jm_bw, cpi->jm_bh);
++      for (int i = 0; i < cpi->jm_bw * cpi->jm_bh; ++i)
++        fprintf(f, "%.9g%c", cpi->jm_qf[i], (i + 1) % cpi->jm_bw ? ' ' : '\n');
++    }
++    fclose(f);
++  }
++  if (q_cfg->lambda_map) {
++    // "lambda <cols> <rows>" then one positive scale per 16x16 luma block,
++    // row-major. A map for another grid is an error, never a fallback.
++    FILE *f = fopen(q_cfg->lambda_map, "r");
++    int cols = 0, rows = 0;
++    if (!f || fscanf(f, " lambda %d %d", &cols, &rows) != 2 ||
++        cols != num_cols || rows != num_rows) {
++      if (f) fclose(f);
++      avm_internal_error(&cpi->common.error, AVM_CODEC_INVALID_PARAM,
++                         "lambda-map: %s is not a %dx%d map",
++                         q_cfg->lambda_map, num_cols, num_rows);
++    }
++    double map_log_sum = 0.0;
++    for (int i = 0; i < num_rows * num_cols; ++i) {
++      double v = 0.0;
++      if (fscanf(f, "%lf", &v) != 1 || !(v > 0.0)) {
++        fclose(f);
++        avm_internal_error(&cpi->common.error, AVM_CODEC_INVALID_PARAM,
++                           "lambda-map: %s: entry %d is missing or not "
++                           "positive", q_cfg->lambda_map, i);
++      }
++      cpi->ssim_rdmult_scaling_factors[i] = v;
++      map_log_sum += log(v);
++    }
++    fclose(f);
++    // Keep the frame's mean lambda where tune=ssim keeps it: the map moves
++    // rate between blocks, not the frame's overall rate.
++    map_log_sum = exp(map_log_sum / (double)(num_rows * num_cols));
++    for (int i = 0; i < num_rows * num_cols; ++i)
++      cpi->ssim_rdmult_scaling_factors[i] /= map_log_sum;
++  }
+ }
+ 
+ /* Active region detection and clustering */
