@@ -13,7 +13,7 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: seven encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: eight encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
 | `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
@@ -79,6 +79,33 @@ Measured on an M3 Max with other work running, so read them as approximate.
   loop restoration costs it about 4x on one core. The encoder pays: one 600px
   tile with qmseg on took 12 s at speed 6 and 33 s with `tool-unlock=6`, 37 s
   at speed 3 and 145 s with it.
+- **iq-deltaq (patch 0008), and 0007 on dense crops, 2026-10-17.** AVM codes
+  DC on its AC table and its `enable-chroma-deltaq` hook sets nothing, so an
+  AV2 still gets neither of the quantizer balances libaom's tune=iq gives the
+  AV1 inside AVIF: DC finer than AC (AV1's DC table runs at 0.84x the AC step
+  around qindex 100) and 4:4:4 chroma AC coarser. Patch 0008 adds them as
+  frame-level deltas, read off libaom's own tables at the AV1 qindex with the
+  same AC step. Scored on a 4-core x86 Linux box without SIMDe, against AVIF
+  at aadhar.sh's shipping flags (libaom 3.15.1, `-q 50/63/80 -d 10 --speed 2
+  --yuv 444`), on the 320px window with the most fine detail in each of 8
+  public-domain photos: 24 crop-budget pairs, AV2 at speed 6 with that
+  site's qmseg flags, bracketed on qp and interpolated to the AVIF's exact
+  bytes, every file decoded at 16 bits and rounded once. Against AVIF:
+
+  | AV2 config | ssimulacra2 | wins | butteraugli |
+  |---|---|---|---|
+  | qmseg flags only | -0.47 | 8 of 24 | +0.083 |
+  | + iq-deltaq=1 | -0.53 | 6 of 24 | +0.112 |
+  | + tool-unlock=6 | +0.38 | 18 of 24 | -0.042 |
+  | + both | +0.38 | 18 of 24 | -0.042 |
+
+  0007 carries the result here as it did on the 600px tiles: from losing two
+  thirds of these calls to winning three quarters, at every budget tested
+  (+0.82, +0.26 and +0.07 at 0.69, 1.07 and 1.80 bits per pixel). 0008 does
+  what it says and nets nothing: luma's 8x8 block-mean error falls on 23 of
+  24 crops, chroma's rises on all 24, and ssimulacra2 reads the trade as a
+  tie (-0.06, and -0.00 beside tool-unlock). It stays in, off by default, as
+  the record of that.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
