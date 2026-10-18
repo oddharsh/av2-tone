@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds ten encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds eleven encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -72,6 +72,9 @@
 #                        with enable-ext-seg, 4 QM sets), so block-level
 #                        quantization is decided outside AVM. Also fixes the
 #                        final encode keeping another segment's quantizer
+#   0011 qm-file         qm-file=<file>: user-defined quantization matrices per
+#                        level, sent in AV2's QM OBU (they shape transforms up
+#                        to 8x8; AV2 keeps its own for larger ones)
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -279,4 +282,43 @@ st=$?
 set -e
 [ "$st" = 1 ] && grep -q "seg-map: not a" "$GATE/wrongseg.log" || {
   echo "error: a seg-map for the wrong grid was not refused cleanly (exit $st)" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips; seg-map decodes inside superblocks)"
+# 0011's qm-file. With the QM level pinned at 8, a file that replaces only
+# level 9 must leave the pixels alone (it adds the QM OBU and nothing else), a
+# steeper level 8 must change them, the reference decoder must read that file
+# as the tuned build does, and a value under 5 must exit 1 with the reason.
+QM=(-a enable-qm=1 -a qm-min=8 -a qm-max=8)
+qmfile() {  # qmfile <level> <the first value, 5..255>
+  awk -v l="$1" -v first="$2" 'BEGIN {
+    print "level", l
+    split("y u v", pl, " "); split("8 8 8 4 4 8", wh, " "); split("8x8 8x4 4x8", nm, " ")
+    for (p = 1; p <= 3; p++) for (t = 1; t <= 3; t++) {
+      w = wh[2 * t - 1]; h = wh[2 * t]; line = pl[p] nm[t]
+      for (y = 0; y < h; y++) for (x = 0; x < w; x++) {
+        v = int(32 * 2 ^ (0.18 * (x * 8 / w + y * 8 / h)) + 0.5); if (v > 255) v = 255
+        if (p == 1 && t == 1 && x == 0 && y == 0) v = first
+        line = line " " v }
+      print line } }'
+}
+qmfile 9 32 > "$GATE/l9.qm"; qmfile 8 32 > "$GATE/l8.qm"; qmfile 8 4 > "$GATE/bad.qm"
+"$TUNED/avifenc" "${BASE[@]}" "${QM[@]}" "$IMG" "$GATE/qm.avif" >/dev/null
+for q in l9 l8; do
+  "$TUNED/avifenc" "${BASE[@]}" "${QM[@]}" -a qm-file="$GATE/$q.qm" "$IMG" "$GATE/$q.avif" >/dev/null
+  "$OUT/avifdec" "$GATE/$q.avif" "$GATE/$q.pristine.y4m" >/dev/null
+done
+"$OUT/avifdec" "$GATE/qm.avif" "$GATE/qm.pristine.y4m" >/dev/null
+cmp -s "$GATE/qm.avif" "$GATE/l9.avif" && {
+  echo "error: a qm-file for level 9 wrote no QM OBU" >&2; exit 1; }
+cmp -s "$GATE/qm.pristine.y4m" "$GATE/l9.pristine.y4m" || {
+  echo "error: a qm-file for an unused level changed the pixels" >&2; exit 1; }
+cmp -s "$GATE/qm.pristine.y4m" "$GATE/l8.pristine.y4m" && {
+  echo "error: a qm-file for the level in use left the pixels alone" >&2; exit 1; }
+"$TUNED/avifdec" "$GATE/l8.avif" "$GATE/l8.tuned.y4m" >/dev/null
+cmp -s "$GATE/l8.pristine.y4m" "$GATE/l8.tuned.y4m" || {
+  echo "error: the reference decoder reads a qm-file file differently" >&2; exit 1; }
+set +e
+"$TUNED/avifenc" "${BASE[@]}" "${QM[@]}" -a qm-file="$GATE/bad.qm" "$IMG" "$GATE/bad.avif" >"$GATE/bad.log" 2>&1
+st=$?
+set -e
+[ "$st" = 1 ] && grep -q "qm-file: level 8 y8x8 needs" "$GATE/bad.log" || {
+  echo "error: a qm-file value under 5 was not refused cleanly (exit $st)" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips; seg-map decodes inside superblocks; qm-file changes only the level it replaces)"

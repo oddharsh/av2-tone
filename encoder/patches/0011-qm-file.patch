@@ -1,0 +1,160 @@
+diff --avm
+--- a/av2/arg_defs.c
++++ b/av2/arg_defs.c
+@@ -573,6 +573,11 @@
+                      "Text file of a segment id per 8x8 luma block, with a "
+                      "qindex delta and luma QM level per segment; replaces "
+                      "qmseg (default none)"),
++  .qm_file = ARG_DEF(NULL, "qm-file", 1,
++                     "Text file of user-defined quantization matrices, sent "
++                     "in a QM OBU: per level, inverse weights (32 is flat) "
++                     "for the Y, U and V 8x8, 8x4 and 4x8 matrices; needs "
++                     "enable-qm=1 (default none)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h
++++ b/av2/arg_defs.h
+@@ -200,6 +200,7 @@
+   arg_def_t lambda_map;
+   arg_def_t field_dump;
+   arg_def_t seg_map;
++  arg_def_t qm_file;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c
++++ b/av2/av2_cx_iface.c
+@@ -268,6 +268,7 @@
+   const char *lambda_map;
+   const char *field_dump;
+   const char *seg_map;
++  const char *qm_file;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -618,6 +619,7 @@
+   NULL,   // lambda_map
+   NULL,   // field_dump
+   NULL,   // seg_map
++  NULL,   // qm_file
+ };
+ // clang-format on
+ 
+@@ -649,6 +651,8 @@
+   // Number of stats buffers required for look ahead
+   int num_lap_buffers;
+   STATS_BUFFER_CTX stats_buf_context;
++  // qm-file (patches/0011): loaded into cpi once, before the first frame.
++  int qm_file_loaded;
+ };
+ 
+ static INLINE int gcd(int64_t a, int b) {
+@@ -931,6 +935,87 @@
+   return AVM_CODEC_OK;
+ }
+ 
++// qm-file (patches/0011): user-defined quantization matrices, read before
++// the first frame and handed to the same tables AV2E_SET_USER_DEFINED_QMATRIX
++// fills, so the encoder quantizes with them and writes them in a QM OBU. The
++// file, per level it replaces (0..14; the rest keep AVM's own):
++//   level <L>
++//   y8x8 <64 values>  y8x4 <32>  y4x8 <32>, and the same for u and v
++// Values are inverse weights, 5..255, 32 flat. AV2 derives 4x4 transforms
++// from the 8x8 matrix and keeps its own for anything larger than 8x8.
++static avm_codec_err_t load_qm_file(avm_codec_alg_priv_t *ctx) {
++  static char err[200];
++  struct av2_extracfg *const cfg = &ctx->extra_cfg;
++  if (!cfg->qm_file || ctx->qm_file_loaded) return AVM_CODEC_OK;
++  if (!cfg->enable_qm) ERROR("qm-file needs enable-qm=1");
++  AV2_COMP *const cpi = ctx->cpi;
++  if (cpi->common.seq_params.monochrome) ERROR("qm-file: monochrome is not supported");
++  FILE *f = fopen(cfg->qm_file, "r");
++  if (!f) ERROR("qm-file: cannot open the file");
++  static const char *const kNames[3] = { "8x8", "8x4", "4x8" };
++  static const int kCount[3] = { 64, 32, 32 };
++  qm_val_t m[NUM_CUSTOM_QMS][3][3][64];  // level, size, plane
++  int have[NUM_CUSTOM_QMS] = { 0 }, seen[NUM_CUSTOM_QMS][3][3] = { { { 0 } } };
++  int level = -1, nlevels = 0;
++  char tok[16];
++  *err = 0;
++  while (!*err && fscanf(f, "%15s", tok) == 1) {
++    if (!strcmp(tok, "level")) {
++      if (fscanf(f, "%d", &level) != 1 || level < 0 || level >= NUM_CUSTOM_QMS ||
++          have[level])
++        snprintf(err, sizeof(err), "qm-file: bad or repeated level (0..%d)",
++                 NUM_CUSTOM_QMS - 1);
++      else
++        have[level] = 1, ++nlevels;
++      continue;
++    }
++    int plane = -1, size = -1;
++    for (int p = 0; p < 3; ++p)
++      for (int t = 0; t < 3; ++t)
++        if (tok[0] == "yuv"[p] && !strcmp(tok + 1, kNames[t])) plane = p, size = t;
++    if (level < 0 || plane < 0 || seen[level][size][plane]) {
++      snprintf(err, sizeof(err),
++               "qm-file: '%s' is not a matrix name (y8x8 ... v4x8) after a "
++               "level line, or repeats one", tok);
++      break;
++    }
++    seen[level][size][plane] = 1;
++    for (int i = 0; i < kCount[size]; ++i) {
++      int v = 0;
++      if (fscanf(f, "%d", &v) != 1 || v <= 4 || v > 255) {
++        snprintf(err, sizeof(err),
++                 "qm-file: level %d %s needs %d values from 5 to 255", level,
++                 tok, kCount[size]);
++        break;
++      }
++      m[level][size][plane][i] = (qm_val_t)v;
++    }
++  }
++  if (!*err && !feof(f)) snprintf(err, sizeof(err), "qm-file: unreadable text");
++  fclose(f);
++  for (int l = 0; !*err && l < NUM_CUSTOM_QMS; ++l)
++    for (int t = 0; have[l] && t < 3; ++t)
++      for (int p = 0; p < 3; ++p)
++        if (!seen[l][t][p] && !*err)
++          snprintf(err, sizeof(err), "qm-file: level %d lacks %c%s", l,
++                   "yuv"[p], kNames[t]);
++  if (!*err && !nlevels) snprintf(err, sizeof(err), "qm-file: no levels");
++  if (*err) ERROR(err);
++  for (int l = 0; l < NUM_CUSTOM_QMS; ++l) {
++    if (!have[l]) continue;
++    if (!cpi->user_defined_qm_list[l]) cpi->user_defined_qm_list[l] = av2_alloc_qmset();
++    for (int t = 0; t < 3; ++t)
++      for (int p = 0; p < 3; ++p)
++        memcpy(cpi->user_defined_qm_list[l][t][p], m[l][t][p],
++               kCount[t] * sizeof(qm_val_t));
++    cpi->use_user_defined_qm[l] = true;
++  }
++  cfg->user_defined_qmatrix = 1;
++  cpi->oxcf.q_cfg.user_defined_qmatrix = true;
++  ctx->qm_file_loaded = 1;
++  return AVM_CODEC_OK;
++}
++
+ // seg-map (patches/0010), checked before the frame for the same reason.
+ static avm_codec_err_t validate_seg_map(avm_codec_alg_priv_t *ctx,
+                                         const avm_image_t *img) {
+@@ -3299,6 +3384,7 @@
+     res = validate_img(ctx, img);
+     if (res == AVM_CODEC_OK) res = validate_lambda_map(ctx, img);
+     if (res == AVM_CODEC_OK) res = validate_seg_map(ctx, img);
++    if (res == AVM_CODEC_OK) res = load_qm_file(ctx);
+     // TODO(jzern) the checks related to cpi's validity should be treated as a
+     // failure condition, encoder setup is done fully in init() currently.
+     if (res == AVM_CODEC_OK) {
+@@ -4229,6 +4315,9 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.seg_map, argv,
+                                   err_string)) {
+     extra_cfg.seg_map = value;
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.qm_file, argv,
++                                  err_string)) {
++    extra_cfg.qm_file = value;
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.tool_unlock,
+                                   argv, err_string)) {
+     extra_cfg.tool_unlock = avm_arg_parse_int_helper(&arg, err_string);

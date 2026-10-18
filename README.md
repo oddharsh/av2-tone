@@ -13,7 +13,7 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: ten encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: eleven encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
 | `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
@@ -146,6 +146,20 @@ Measured on an M3 Max with other work running, so read them as approximate.
   AQ never mixed segments on these crops, so nothing had tripped it. 0010
   resets it for a seg-map too; qmseg, whose segments share a qindex, was
   never affected (`--test-decode` passes at speeds 3 and 6).
+- **qm-file (patch 0011), 2026-10-18.** AV2 can send its own quantization
+  matrices in a QM OBU, which AV1 cannot, and AVM has the control for it but
+  no way to feed one from a file. Patch 0011 reads one: per level, the
+  inverse weights (32 flat) of the Y, U and V 8x8, 8x4 and 4x8 matrices. Three
+  things bound what it can do. A custom matrix shapes only transforms up to
+  8x8; larger ones keep AVM's own for that level. AV2 derives a 4x4 matrix by
+  downsampling the 8x8 one, and AVM's built-in 4x4 tables differ from that at
+  521 of 720 entries, so even AVM's own matrices sent back change the coding
+  (level 8 on a 320px crop: 44 B smaller, ssimulacra2 -0.13). And the OBU
+  costs 29 to 150 B a level on that crop (about 1.3 KB for all 15, 5% of the
+  file), so a file should carry only the levels the frame uses: replacing an
+  unused level adds the OBU and leaves every pixel alone, which the build
+  gate checks. `avmenc --test-decode` passes on AVM's own matrices and on a
+  steeper set.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
