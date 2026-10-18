@@ -283,15 +283,52 @@ Measured on an M3 Max with other work running, so read them as approximate.
   | s = 3, 8 levels | +1.35% | 3 of 8 | +3.4% |
   | s = 4, 8 levels | +4.85% | 2 of 8 | +11.0% |
   | s = 2, 4 levels | -0.48% | 3 of 8 | -0.0% |
+  | s = 2, 3 levels | -0.87% | 6 of 8 | +3.5% |
+  | s = 2, 2 levels | +2.04% | 2 of 8 | +7.8% |
   | s = 2, 4 levels, QM split by qmseg's 64px units | +0.34% | 3 of 8 | +2.4% |
 
   Moving qmseg's split from 64px units to 8x8 blocks costs 1.1% on its own,
   the price of a segment id per block. The offsets buy some of it back, most
-  at twice jpegli's own strength, and fewer levels cost less: s = 2 with 4
-  levels is the one map so far ahead of shipping on both metrics, by 0.5% on
-  ssimulacra2 with 3 crops of 8 better, within what one or two crops can
-  move. 2 and 3 levels, and the best of them on 8 held-out photos at speed
-  3, are running; this entry gets their numbers.
+  at twice jpegli's own strength, and fewer levels cost less, down to 3: at
+  2, most crops lose qmseg's QM split, since no level is mostly textured.
+  3 levels is the best ssimulacra2 reading of the series (-0.87%, 6 of 8
+  crops better), but butteraugli reads it +3.5%; 4 levels is the one map
+  neither metric marks worse. A rerun of 4 levels reproduced -0.48% and
+  -0.02% exactly. Both go to 8 held-out photos at speed 3 next.
+- **jpegli matrices in a qm-file (patch 0011), 2026-10-18.** jpegli's base
+  YCbCr tables give one step per 8x8 DCT coefficient and plane; as AV2
+  inverse weights they are 32 * (Q[k] / Q[0])^alpha, alpha 1 being jpegli's
+  own shape, with 8x4 and 4x8 sampled from the 8x8 at equal frequency (the
+  4-point index v is the 8-point index 2v, as AV2 derives 4x4). Each file
+  carries only the levels its encode uses: qm-curve=1 puts the frame on level
+  9 at qp 80 and 95 and level 8 at 110 and 125, and qmseg's textured
+  segments use level 12. Same crops and method, against the shipping qmseg
+  config:
+
+  | qm-file | ssimulacra2 BD-rate | crops better | butteraugli BD-rate |
+  |---|---|---|---|
+  | AVM's own matrices (null) | +1.41% | 0 of 8 | +4.7% |
+  | jpegli, alpha 0.5 | +5.62% | 0 of 8 | +7.5% |
+  | jpegli, alpha 0.75 | +7.20% | 0 of 8 | +12.4% |
+  | jpegli, alpha 1 | +7.37% | 0 of 8 | +12.2% |
+  | jpegli, alpha 0.5, its distance-3 shape | +5.02% | 0 of 8 | +9.2% |
+
+  Sending AVM's own matrices back costs 1.4%: the QM OBU (about 100 to 250 B
+  against 10 to 25 KB crops) and the 4x4 matrices AV2 derives from the 8x8,
+  which differ from AVM's built-in ones. Every jpegli shape loses beyond
+  that, more the steeper it is. The reason shows when AVM's matrices are
+  read as a function of frequency (index k of an N-point transform at
+  k / 2N cycles a pixel): its 8x8 and its 32x32 agree to 0.07 octaves rms,
+  one curve across sizes, and since a qm-file reaches only the transforms up
+  to 8x8, 16x16 and up keep it. Fitted to that curve where the two overlap,
+  jpegli's shape needs alpha of only 0.30 (luma, level 8), 0.22 (level 9)
+  and 0.02 (level 12, which AVM keeps nearly flat), and still misses it by
+  0.28 octaves rms on luma at level 8: jpegli rises early and plateaus, AVM
+  rises late. So alpha 0.5 and up weights small transforms 2 to 3x more
+  steeply than large ones at the same frequency. Matrices at the fitted
+  alpha, per level and plane, are being measured, along with which of
+  levels 8/9 and 12 a matrix helps on; they and a held-out check at speed 3
+  get added here.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
