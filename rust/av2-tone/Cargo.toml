@@ -1,0 +1,18 @@
+[package]
+name = "av2-tone"
+version = "0.0.0"
+description = "A safe-Rust AV2 still-image decoder, checked bit for bit against AVM"
+publish = false
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "av2_tone"
+
+# No dependencies, on purpose: the decoder is std and nothing else.
+[dependencies]
+
+[lints]
+workspace = true

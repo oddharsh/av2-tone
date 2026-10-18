@@ -1,0 +1,53 @@
+seq.id 0
+seq.profile 1
+seq.single_picture 1
+seq.level_tier 0 0
+seq.format 8 1 1 0
+seq.still 1
+seq.max_size 250 186 8 8
+seq.conf_win 0 0 0 0 0
+seq.sb_size 64
+seq.partition 1 0 0 0 2
+seq.segment 0 0
+seq.intra 0 1 1 1 2 1 1
+seq.inter 1 1 2 3 0 1
+seq.scc 2 2
+seq.transform 1 1 1 1 0 0 1
+seq.quant 0 0 1 1 0
+seq.dc_ac 1 0 0 0 0 0 0
+seq.filter 0 1 1 0 1 0 2 1
+seq.restoration 0
+seq.tile_info 0
+seq.film_grain 0
+frame.ids 0 0
+frame.type_show_refresh 0 1 3
+frame.sb_size 64
+frame.size 250 186 64 48
+frame.scc 1 0
+frame.intrabc 1 1 1
+frame.bvp_drl 3
+frame.cdf_off 0
+frame.tiles 1 1 1 0 0
+frame.tile_cols 0 4
+frame.tile_rows 0 3
+frame.q 105 0 0 0 0 0
+frame.seg 0
+frame.qm 0
+frame.delta_q 0 1
+frame.qindex 105 105 105 105 105 105 105 105
+frame.lossless 0 0 0 0 0 0 0 0
+frame.coded_lossless 0
+frame.tcq_ph 0 0
+frame.deblock 1 1 0 1 3 3 0 0
+frame.gdf 2 3 2 128 4
+frame.cdef 1 4 5 1
+frame.cdef_y 16 0 58 18 10
+frame.cdef_uv 16 10 2 18 2
+frame.ccso 1 8
+frame.ccso0 1
+frame.ccso0_params 0 0 1 0 1 3
+frame.ccso0_offsets 0 0 0 -7 0 -3 0 0 0 0 -1 -1 0 0 0 0 0 0 7 -1 0 -1 0 0 0 0 1 0 0 0 0 0
+frame.ccso1 0
+frame.ccso2 0
+frame.tx 1 0
+frame.header_bits 174
