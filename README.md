@@ -13,7 +13,7 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: eight encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: ten encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
 | `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
@@ -106,6 +106,46 @@ Measured on an M3 Max with other work running, so read them as approximate.
   24 crops, chroma's rises on all 24, and ssimulacra2 reads the trade as a
   tie (-0.06, and -0.00 beside tool-unlock). It stays in, off by default, as
   the record of that.
+- **lambda-map (patch 0009), 2026-10-17.** AVM decides every block by
+  squared error, and tune=ssim's per-16x16 RD multiplier curve (a fixed
+  function of local variance, which libavif turns on for every AV2 encode)
+  is its only perceptual weighting. Patch 0009 dumps that curve and the
+  jpegli masking field, and takes any map in its place. Screened at speed 6
+  with `tool-unlock=6` on the same 8 dense crops, 4 fixed qps each, as
+  ssimulacra2 BD-rate against tune=ssim's own curve (positive is bigger
+  files at equal score):
+
+  | lambda map | ssimulacra2 BD-rate | crops better | butteraugli BD-rate |
+  |---|---|---|---|
+  | flat (no weighting) | +6.54% | 0 of 8 | +6.0% |
+  | tune=ssim curve, power 1.5 | +0.93% | 3 of 8 | +9.3% |
+  | tune=ssim curve, power 0.5 | +2.20% | 0 of 8 | +4.4% |
+  | jpegli field qf^-3 | +1.70% | 3 of 8 | -2.0% |
+  | jpegli field qf^-6 | +3.38% | 2 of 8 | +5.9% |
+  | jpegli field qf^-9 | +15.66% | 1 of 8 | +39.3% |
+  | tune=ssim times qf^-3 | +1.36% | 3 of 8 | +7.3% |
+
+  tune=ssim's curve is worth 6.5%, and the flat map lands exactly on
+  tune=psnr's +6.54% from the same crops, so the weighting is all tune=psnr
+  gives up. Nothing beats the curve on ssimulacra2: it sits at the optimum
+  of its own strength, and jpegli's field, about 6x flatter in log terms
+  (0.07 against 0.41 standard deviation), loses at every strength. qf^-3 is
+  the one map butteraugli prefers (-2.0%): the two metrics disagree about
+  how much texture masks. Off by default; the options stay so a map can be
+  built outside AVM.
+- **seg-map (patch 0010), 2026-10-17.** A segment id per 8x8 luma block,
+  each segment with a qindex delta and a luma QM level, so block-level
+  quantization can be decided outside AVM (up to 8 segments, 16 with
+  `enable-ext-seg=1`, and AV2's limit of 4 QM sets). A map of qmseg's own
+  split reproduces qmseg's files byte for byte on all 8 crops. Building it
+  found an AVM bug: the final encode of a block keeps the quantizer of the
+  last RD candidate, so inside a superblock that mixes segment qindexes a
+  block was quantized at one qindex and signalled at another (`avmenc
+  --test-decode`: mismatch at Y[2, 126]; about 10 dB of luma PSNR on the
+  fixture). AVM resets the quantizer only for an AQ mode, and its variance
+  AQ never mixed segments on these crops, so nothing had tripped it. 0010
+  resets it for a seg-map too; qmseg, whose segments share a qindex, was
+  never affected (`--test-decode` passes at speeds 3 and 6).
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 

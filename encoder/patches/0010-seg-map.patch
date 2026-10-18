@@ -1,0 +1,347 @@
+diff --avm
+--- a/av2/arg_defs.c
++++ b/av2/arg_defs.c
+@@ -569,6 +569,10 @@
+   .field_dump = ARG_DEF(NULL, "field-dump", 1,
+                         "Write tune=ssim's 16x16 scales and the jpegli 8x8 "
+                         "masking field to this text file (default none)"),
++  .seg_map = ARG_DEF(NULL, "seg-map", 1,
++                     "Text file of a segment id per 8x8 luma block, with a "
++                     "qindex delta and luma QM level per segment; replaces "
++                     "qmseg (default none)"),
+   .enable_intra_edge_filter = ARG_DEF(NULL, "enable-intra-edge-filter", 1,
+                                       "Enable intra edge filtering "
+                                       "(0: false, 1: true (default))"),
+diff --avm
+--- a/av2/arg_defs.h
++++ b/av2/arg_defs.h
+@@ -199,6 +199,7 @@
+   arg_def_t iq_deltaq;
+   arg_def_t lambda_map;
+   arg_def_t field_dump;
++  arg_def_t seg_map;
+   arg_def_t enable_intra_edge_filter;
+   arg_def_t reduced_tx_part_set;
+   arg_def_t enable_flip_idtx;
+diff --avm
+--- a/av2/av2_cx_iface.c
++++ b/av2/av2_cx_iface.c
+@@ -28,6 +28,7 @@
+ 
+ #include "av2/av2_iface_common.h"
+ #include "av2/common/quant_common.h"
++#include "av2/encoder/aq_variance.h"
+ #include "av2/encoder/bitstream.h"
+ #include "av2/encoder/encoder.h"
+ #include "av2/encoder/ethread.h"
+@@ -266,6 +267,7 @@
+   int iq_deltaq;
+   const char *lambda_map;
+   const char *field_dump;
++  const char *seg_map;
+ };
+ 
+ // Example subgop configs. Currently not used by default.
+@@ -615,6 +617,7 @@
+   0,      // iq_deltaq
+   NULL,   // lambda_map
+   NULL,   // field_dump
++  NULL,   // seg_map
+ };
+ // clang-format on
+ 
+@@ -928,6 +931,29 @@
+   return AVM_CODEC_OK;
+ }
+ 
++// seg-map (patches/0010), checked before the frame for the same reason.
++static avm_codec_err_t validate_seg_map(avm_codec_alg_priv_t *ctx,
++                                        const avm_image_t *img) {
++  static char err[200];
++  const struct av2_extracfg *const cfg = &ctx->extra_cfg;
++  if (!cfg->seg_map) return AVM_CODEC_OK;
++  if (cfg->qmseg) ERROR("seg-map replaces qmseg; drop qmseg=1");
++  if (cfg->aq_mode != NO_AQ) ERROR("seg-map needs aq-mode=0");
++  SegMap m;
++  const int bad = av2_segmap_read(
++      cfg->seg_map, ((int)img->d_w + 7) >> 3, ((int)img->d_h + 7) >> 3,
++      cfg->enable_ext_seg ? MAX_SEGMENTS : MAX_SEGMENTS_8, &m, err,
++      sizeof(err));
++  int wants_qm = 0;
++  for (int s = 0; !bad && s < MAX_SEGMENTS; ++s)
++    wants_qm |= m.used[s] && m.qm[s] >= 0;
++  av2_segmap_free(&m);
++  if (bad) ERROR(err);
++  if (wants_qm && !cfg->enable_qm)
++    ERROR("seg-map: a QM level needs enable-qm=1");
++  return AVM_CODEC_OK;
++}
++
+ static avm_codec_err_t validate_img(avm_codec_alg_priv_t *ctx,
+                                     const avm_image_t *img) {
+ #if CONFIG_TESTONLY_12BIT_SUPPORT
+@@ -1554,6 +1580,7 @@
+   q_cfg->iq_deltaq = extra_cfg->iq_deltaq != 0;
+   q_cfg->lambda_map = extra_cfg->lambda_map;
+   q_cfg->field_dump = extra_cfg->field_dump;
++  q_cfg->seg_map = extra_cfg->seg_map;
+   q_cfg->aq_mode = extra_cfg->aq_mode;
+   q_cfg->deltaq_mode = extra_cfg->deltaq_mode;
+   q_cfg->use_fixed_qp_offsets =
+@@ -3271,6 +3298,7 @@
+   if (img != NULL) {
+     res = validate_img(ctx, img);
+     if (res == AVM_CODEC_OK) res = validate_lambda_map(ctx, img);
++    if (res == AVM_CODEC_OK) res = validate_seg_map(ctx, img);
+     // TODO(jzern) the checks related to cpi's validity should be treated as a
+     // failure condition, encoder setup is done fully in init() currently.
+     if (res == AVM_CODEC_OK) {
+@@ -4198,6 +4226,9 @@
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.field_dump,
+                                   argv, err_string)) {
+     extra_cfg.field_dump = value;
++  } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.seg_map, argv,
++                                  err_string)) {
++    extra_cfg.seg_map = value;
+   } else if (avm_arg_match_helper(&arg, &g_av2_codec_arg_defs.tool_unlock,
+                                   argv, err_string)) {
+     extra_cfg.tool_unlock = avm_arg_parse_int_helper(&arg, err_string);
+diff --avm
+--- a/av2/encoder/aq_variance.c
++++ b/av2/encoder/aq_variance.c
+@@ -15,6 +15,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++#include "avm_ports/bitops.h"
+ #include "avm_ports/mem.h"
+ 
+ #include "av2/encoder/aq_variance.h"
+@@ -556,3 +557,144 @@
+   memset(qp->qm_index, 0, sizeof(qp->qm_index));
+   qp->qm_index[1] = 1;
+ }
++
++// seg-map (patches/0010). The file:
++//   segmap <cols> <rows>          the 8x8 luma block grid, ceil(w/8) x ceil(h/8)
++//   <cols * rows segment ids>     row-major
++//   seg <id> <qindex delta> <qm>  one line per segment; qm is a luma QM level
++//                                 0..15, or -1 for the frame's own
++// A block takes the smallest id under it, so number segments finest first.
++// The frame gets at most 4 QM sets (AV2's limit): its own plus 3 levels.
++int av2_segmap_read(const char *path, int cols, int rows, int max_segs,
++                    SegMap *m, char *err, size_t err_len) {
++  memset(m, 0, sizeof(*m));
++  FILE *f = fopen(path, "r");
++  if (!f) {
++    snprintf(err, err_len, "seg-map: cannot open %s", path);
++    return -1;
++  }
++  int ok = fscanf(f, " segmap %d %d", &m->cols, &m->rows) == 2;
++  if (!ok || m->cols != cols || m->rows != rows) {
++    snprintf(err, err_len, "seg-map: not a 'segmap %d %d' grid", cols, rows);
++    fclose(f);
++    return -1;
++  }
++  m->ids = (uint8_t *)avm_malloc((size_t)cols * rows);
++  int in_map[MAX_SEGMENTS] = { 0 };
++  for (int i = 0; ok && i < cols * rows; ++i) {
++    int id = -1;
++    ok = m->ids && fscanf(f, "%d", &id) == 1 && id >= 0 && id < max_segs;
++    if (ok) m->ids[i] = (uint8_t)id, in_map[id] = 1;
++  }
++  if (!ok) {
++    snprintf(err, err_len,
++             "seg-map: the grid needs %d ids from 0 to %d (8 and up need "
++             "enable-ext-seg=1)",
++             cols * rows, max_segs - 1);
++    fclose(f);
++    return -1;
++  }
++  int id, dq, qm, levels[MAX_SEGMENTS], nlevels = 0;
++  while (fscanf(f, " seg %d %d %d", &id, &dq, &qm) == 3) {
++    if (id < 0 || id >= max_segs || m->used[id] || dq < -MAXQ || dq > MAXQ ||
++        qm < -1 || qm >= NUM_QM_LEVELS) {
++      snprintf(err, err_len,
++               "seg-map: bad or repeated line 'seg %d %d %d' (ids 0..%d, "
++               "deltas within +-%d, qm -1..%d)",
++               id, dq, qm, max_segs - 1, MAXQ, NUM_QM_LEVELS - 1);
++      fclose(f);
++      return -1;
++    }
++    m->used[id] = 1, m->qdelta[id] = dq, m->qm[id] = qm;
++    int seen = qm < 0;
++    for (int k = 0; k < nlevels; ++k) seen |= levels[k] == qm;
++    if (!seen) levels[nlevels++] = qm;
++  }
++  ok = feof(f) || (fscanf(f, " "), feof(f));
++  fclose(f);
++  if (!ok) {
++    snprintf(err, err_len, "seg-map: unreadable text after the seg lines");
++    return -1;
++  }
++  for (int s = 0; s < max_segs; ++s) {
++    if (in_map[s] && !m->used[s]) {
++      snprintf(err, err_len, "seg-map: segment %d is in the grid but has no "
++               "seg line", s);
++      return -1;
++    }
++  }
++  if (nlevels > 3) {
++    snprintf(err, err_len, "seg-map: %d QM levels besides the frame's own; "
++             "AV2 allows 3", nlevels);
++    return -1;
++  }
++  return 0;
++}
++
++void av2_segmap_free(SegMap *m) {
++  avm_free(m->ids);
++  m->ids = NULL;
++}
++
++// Runs where qmseg does (after av2_set_quantizer), and in its place: the map,
++// read from the file, decides every block's segment.
++void av2_segmap_frame_setup(AV2_COMP *cpi) {
++  AV2_COMMON *const cm = &cpi->common;
++  const char *const path = cpi->oxcf.q_cfg.seg_map;
++  if (!path || !frame_is_intra_only(cm)) return;
++  struct segmentation *const seg = &cm->seg;
++  CommonQuantParams *const qp = &cm->quant_params;
++  const int ext = cm->seq_params.enable_ext_seg;
++  const int cols = (cm->width + 7) >> 3, rows = (cm->height + 7) >> 3;
++  SegMap m;
++  char err[200];
++  if (av2_segmap_read(path, cols, rows, ext ? MAX_SEGMENTS : MAX_SEGMENTS_8,
++                      &m, err, sizeof(err))) {
++    av2_segmap_free(&m);
++    avm_internal_error(&cm->error, AVM_CODEC_INVALID_PARAM, "%s", err);
++  }
++  int top = 0, nsets = 1;
++  for (int s = 0; s < MAX_SEGMENTS; ++s)
++    if (m.used[s]) top = s;
++  // One segment that changes nothing is no map, as qmseg's one-class case.
++  if (top == 0 && m.qdelta[0] == 0 && m.qm[0] < 0) {
++    av2_segmap_free(&m);
++    return;
++  }
++  const int mi_rows = cm->mi_params.mi_rows, mi_cols = cm->mi_params.mi_cols;
++  for (int r = 0; r < mi_rows; ++r)
++    for (int c = 0; c < mi_cols; ++c)
++      cpi->enc_seg.map[r * mi_cols + c] =
++          m.ids[AVMMIN(r >> 1, rows - 1) * cols + AVMMIN(c >> 1, cols - 1)];
++  av2_enable_segmentation(seg);
++  av2_clearall_segfeatures(seg);
++  seg->enable_ext_seg = ext;
++  // ALT_Q goes on where the offset isn't 0, and on the highest listed id
++  // whatever its offset: AVM clamps ids above the last segment with a
++  // feature, so without it a QM-only top segment would fold into a lower one.
++  // (This is also what qmseg writes, so a map of qmseg's own split gives
++  // qmseg's bytes.)
++  if (qp->using_qmatrix) memset(qp->qm_index, 0, sizeof(qp->qm_index));
++  for (int s = 0; s < MAX_SEGMENTS; ++s) {
++    if (!m.used[s]) continue;
++    if (m.qdelta[s] != 0 || s == top) {
++      av2_set_segdata(seg, s, SEG_LVL_ALT_Q, m.qdelta[s]);
++      av2_enable_segfeature(seg, s, SEG_LVL_ALT_Q);
++    }
++    if (!qp->using_qmatrix || m.qm[s] < 0) continue;
++    int set = 1;
++    while (set < nsets && qp->qm_y[set] != m.qm[s]) ++set;
++    if (set == nsets) {
++      qp->qm_y[set] = m.qm[s];
++      qp->qm_u[set] = qp->qm_u[0];
++      qp->qm_v[set] = qp->qm_v[0];
++      ++nsets;
++    }
++    qp->qm_index[s] = set;
++  }
++  if (qp->using_qmatrix) {
++    qp->pic_qm_num = nsets;
++    qp->qm_index_bits = avm_ceil_log2(nsets);
++  }
++  av2_segmap_free(&m);
++}
+diff --avm
+--- a/av2/encoder/aq_variance.h
++++ b/av2/encoder/aq_variance.h
+@@ -13,6 +13,8 @@
+ #ifndef AVM_AV2_ENCODER_AQ_VARIANCE_H_
+ #define AVM_AV2_ENCODER_AQ_VARIANCE_H_
+ 
++#include <stddef.h>
++
+ #include "av2/encoder/encoder.h"
+ 
+ #ifdef __cplusplus
+@@ -31,6 +33,22 @@
+                                BLOCK_SIZE sb_size);
+ void av2_jpegli_mask_frame(AV2_COMP *cpi);
+ void av2_qmseg_frame_setup(AV2_COMP *cpi);
++
++// seg-map (patches/0010): a segment id per 8x8 luma block, and per segment a
++// qindex offset and a luma QM level (-1: the frame's own).
++typedef struct {
++  int cols, rows;
++  uint8_t *ids;
++  int used[MAX_SEGMENTS];
++  int qdelta[MAX_SEGMENTS];
++  int qm[MAX_SEGMENTS];
++} SegMap;
++// Reads and checks a seg-map for a cols x rows grid. Returns 0, or -1 with
++// the reason in err; either way av2_segmap_free releases it.
++int av2_segmap_read(const char *path, int cols, int rows, int max_segs,
++                    SegMap *m, char *err, size_t err_len);
++void av2_segmap_free(SegMap *m);
++void av2_segmap_frame_setup(AV2_COMP *cpi);
+ int av2_get_sbq_jpegli_mask(const AV2_COMP *cpi, int mi_row, int mi_col,
+                             BLOCK_SIZE sb_size);
+ int av2_compute_q_from_energy_level_deltaq_mode(const AV2_COMP *const cpi,
+diff --avm
+--- a/av2/encoder/encodeframe_utils.c
++++ b/av2/encoder/encodeframe_utils.c
+@@ -359,7 +359,12 @@
+     }
+   }
+ 
+-  if (cpi->oxcf.q_cfg.aq_mode)
++  // The final encode (encode_b) keeps whatever quantizer the last RD
++  // candidate set, which inside a superblock that mixes segments can belong
++  // to another segment's qindex. An AQ mode resets it here, and so must a
++  // seg-map (patches/0010), or the block is quantized at one qindex and
++  // signalled at another.
++  if (cpi->oxcf.q_cfg.aq_mode || cpi->oxcf.q_cfg.seg_map)
+     av2_init_plane_quantizers(cpi, x, mi_addr->segment_id);
+ 
+   if (dry_run) return;
+diff --avm
+--- a/av2/encoder/encoder.c
++++ b/av2/encoder/encoder.c
+@@ -3511,6 +3511,7 @@
+     av2_cyclic_refresh_setup(cpi);
+     av2_apply_active_map(cpi);
+   }
++  av2_segmap_frame_setup(cpi);
+   av2_qmseg_frame_setup(cpi);
+   if (cm->seg.enabled) {
+     if (!cm->seg.update_data && cm->prev_frame) {
+@@ -3699,6 +3700,7 @@
+     } else if (q_cfg->aq_mode == COMPLEXITY_AQ) {
+       av2_setup_in_frame_q_adj(cpi);
+     }
++    av2_segmap_frame_setup(cpi);
+     av2_qmseg_frame_setup(cpi);
+ 
+     if (cm->seg.enabled) {
+diff --avm
+--- a/av2/encoder/encoder.h
++++ b/av2/encoder/encoder.h
+@@ -797,6 +797,8 @@
+   // lambda-map / field-dump (patches/0009): file paths, or NULL.
+   const char *lambda_map;
+   const char *field_dump;
++  // seg-map (patches/0010): file path, or NULL.
++  const char *seg_map;
+   // Indicates if encoding with quantization matrices should be enabled.
+   bool using_qm;
+   // Indicates whether user-defined quantization matrices should be used
