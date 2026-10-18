@@ -294,7 +294,18 @@ Measured on an M3 Max with other work running, so read them as approximate.
   3 levels is the best ssimulacra2 reading of the series (-0.87%, 6 of 8
   crops better), but butteraugli reads it +3.5%; 4 levels is the one map
   neither metric marks worse. A rerun of 4 levels reproduced -0.48% and
-  -0.02% exactly. Both go to 8 held-out photos at speed 3 next.
+  -0.02% exactly. Neither holds on 8 held-out photos at speed 3 (a dense
+  320px crop each: 2 full-size camera photos and 6 web-size JPEGs):
+
+  | seg-map, held out | ssimulacra2 BD-rate | photos better | butteraugli BD-rate |
+  |---|---|---|---|
+  | s = 2, 3 levels | +0.49% | 2 of 8 | +0.4% |
+  | s = 2, 4 levels | +0.02% | 3 of 8 | +1.4% |
+
+  Single photos swing up to 3.5% on ssimulacra2 and 16% on butteraugli,
+  more than either average. Of the two camera photos, samsung5 loses under
+  both maps (+1.6% and +1.1%) and samsung6 is flat (+0.1% and -0.6%).
+  qmseg stays.
 - **jpegli matrices in a qm-file (patch 0011), 2026-10-18.** jpegli's base
   YCbCr tables give one step per 8x8 DCT coefficient and plane; as AV2
   inverse weights they are 32 * (Q[k] / Q[0])^alpha, alpha 1 being jpegli's
@@ -326,9 +337,36 @@ Measured on an M3 Max with other work running, so read them as approximate.
   0.28 octaves rms on luma at level 8: jpegli rises early and plateaus, AVM
   rises late. So alpha 0.5 and up weights small transforms 2 to 3x more
   steeply than large ones at the same frequency. Matrices at the fitted
-  alpha, per level and plane, are being measured, along with which of
-  levels 8/9 and 12 a matrix helps on; they and a held-out check at speed 3
-  get added here.
+  alpha, per level and plane, against the same baseline:
+
+  | qm-file | ssimulacra2 BD-rate | crops better | butteraugli BD-rate |
+  |---|---|---|---|
+  | fitted, levels 8/9 and 12 | +1.53% | 1 of 8 | +2.2% |
+  | fitted to the distance-3 shape | +1.93% | 0 of 8 | +5.9% |
+  | fitted, frame level (8/9) only | +1.73% | 0 of 8 | +4.1% |
+  | fitted, level 12 only | +0.04% | 2 of 8 | +0.6% |
+  | alpha 0.5, level 12 only | +1.68% | 0 of 8 | +5.0% |
+  | alpha 0.5, frame level only | +3.64% | 0 of 8 | +8.2% |
+
+  Fitting closes most of the gap to the null file (+1.53% against +1.41%)
+  but never passes AVM's own matrices. Level 12 alone ties shipping because
+  its fitted luma alpha (0.02) makes it nearly AVM's level 12, and it only
+  touches the 3 crops qmseg splits (cat -0.15%, geese -0.08%, iced coffee
+  +0.52%). Steeper level-12 matrices cost the cat 11%. On the 8 held-out
+  photos at speed 3:
+
+  | qm-file, held out | ssimulacra2 BD-rate | photos better | butteraugli BD-rate |
+  |---|---|---|---|
+  | AVM's own matrices (null) | +2.01% | 0 of 8 | +1.5% |
+  | fitted, level 12 only | +0.56% | 1 of 8 | -1.0% |
+  | fitted, levels 8/9 and 12 | +2.65% | 1 of 8 | +0.3% |
+
+  The null file costs the samsung5 camera photo 8.3%, the most of any
+  photo, which points at the derived 4x4 matrices: a detailed crop codes
+  many 4x4 transforms. No jpegli shape beats AVM's matrices, and the cost of
+  sending any matrix at all (that 4x4 mismatch plus the OBU) is larger than
+  what a shape could buy here. Letting a qm-file set the 4x4 matrix too
+  would isolate the shape from that cost; nothing ships from this.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
