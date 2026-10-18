@@ -1,0 +1,18 @@
+[package]
+name = "av2-check"
+version = "0.0.0"
+description = "Runs av2-tone and the AVM oracle on a corpus and refuses any byte of difference"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "av2-check"
+path = "src/main.rs"
+
+[dependencies]
+av2-tone = { path = "../av2-tone" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["av2-tone", "check"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+repository = "https://github.com/oddharsh/av2-tone"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# A panic in the decoder is a bug: slicing and arithmetic that can overflow
+# have to say why they can't, or return an error instead.
+indexing_slicing = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
