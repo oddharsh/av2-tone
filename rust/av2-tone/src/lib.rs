@@ -16,7 +16,12 @@
 #![forbid(unsafe_code)]
 
 pub mod avif;
+#[rustfmt::skip]
+#[allow(clippy::all)]
+pub mod avm_defs;
 mod bits;
+mod blk;
+mod block;
 pub mod cdf;
 #[rustfmt::skip]
 pub mod cdf_tables;
@@ -25,8 +30,12 @@ pub mod entropy;
 pub mod error;
 pub mod frame;
 pub mod obu;
+pub mod parse;
+mod partition;
+mod residual;
 pub mod seq;
 pub mod tile;
+mod txb;
 
 pub use error::{Error, Result};
 pub use frame::FrameHeader;
@@ -125,16 +134,14 @@ impl Picture {
 
 /// Decodes an OBU stream to a picture.
 ///
-/// Reconstruction isn't built yet: the headers are parsed and checked, the
-/// tiles are split and their entropy state set up, and every sample comes back
-/// as mid-grey, 1 << (bit_depth - 1), the value AVM
-/// fills a plane with before anything is decoded into it. The oracle harness
-/// reports where that first differs from AVM.
+/// Reconstruction isn't built yet: the headers and every tile's symbols are
+/// parsed and checked, and every sample comes back as mid-grey,
+/// 1 << (bit_depth - 1), the value AVM fills a plane with before anything is
+/// decoded into it. The oracle harness reports where that first differs from
+/// AVM.
 pub fn decode_obus(stream: &[u8]) -> Result<(Headers, Picture)> {
     let (headers, group) = parse_obus(stream)?;
-    // Each tile's bytes and starting entropy state. Nothing reads symbols from
-    // them yet, but a tile layout that doesn't fit the OBU fails here.
-    let _tiles = tile::init_tiles(&headers, group.data)?;
+    parse::parse_tiles(&headers, group.data, None)?;
     let (width, height) = headers.output_size();
     let s = &headers.seq;
     let mut pic = Picture {

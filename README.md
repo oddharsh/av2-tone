@@ -19,7 +19,7 @@ can move when the pin does.
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
 | `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
 | `demo/` | encodes your photo as AV1 and AV2 at the same byte count, races the encoders and the decoders (AVM, the fast decoder, dav2d, dav1d) on it, and shows both images on a local page |
-| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and the harness that checks it against pristine AVM on every file of a 55-still corpus. It parses headers and sets up each tile's entropy decoder so far; reconstruction comes next |
+| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and the harness that checks it against pristine AVM on every file of a 57-still corpus. It parses every header and every tile symbol, matching AVM's own trace on all 57; reconstruction comes next |
 
 ## Build
 
@@ -66,21 +66,24 @@ way everything else here is. It has three rules.
   AVM would longjmp out. Clippy refuses unchecked indexing, `unwrap`, `expect`
   and `panic!` in the decoder.
 - **A panic is a bug.** Malformed input ends in `Truncated`, `Invalid` or
-  `Unsupported`, never a crash. `cargo test` cuts three real stills at every
-  length and flips every bit of their headers and tile-size fields to hold it
-  to that, then reads each tile until it runs out of bytes. The harness
-  reports any panic as a failure.
+  `Unsupported`, never a crash. `cargo test` holds it to that on four real
+  stills: it cuts each at every length, and flips every header bit and every
+  61st bit of tile data, then parses every tile in full. The harness reports
+  any panic as a failure. A one-off run over all 57 corpus stills (148,029
+  flips, about 3,000 per file) found none.
 
 The scope is one intra key frame in a single-picture sequence: what this
 repo's encoder writes for a still at speed 6, with `tool-unlock=6` and
 aadhar.sh's qmseg flags. Anything outside it is refused as `Unsupported`
 with the feature named (multi-frame headers, film grain, loop restoration,
-quantization-matrix OBUs, more than one tile group) rather than misread.
+quantization-matrix OBUs, more than one tile group, `TX_MODE_SELECT`,
+signalled 3-way and uneven 4-way partitions, delta q, lossless segments,
+intra DIP) rather than misread. Speed 6 writes none of these.
 
 Built so far, in pipeline order:
 
 - **Headers.** The AVIF container, OBU framing, the sequence header and the
-  key frame's header, tile grid included. On all 55 stills in the corpus,
+  key frame's header, tile grid included. On all 57 stills in the corpus,
   every parsed field matches AVM's, down to the header's length in bits.
 - **The entropy decoder.** AVM's multi-symbol arithmetic decoder (`entdec.c`),
   its bool, literal, bypass and unary reads, `tell` and `tell_frac`, and AV2's
@@ -90,27 +93,43 @@ Built so far, in pipeline order:
   with adaptation on and off. The Rust decoder must recover every symbol,
   match AVM's `tell` after every operation, and end with AVM's CDFs. On 300
   streams (1.2 million operations), it does.
-- **The default CDFs.** `rust/cdf/gen.ts` reads `FRAME_CONTEXT`'s layout out of
+- **The default CDFs.** `rust/gen/cdf.ts` reads `FRAME_CONTEXT`'s layout out of
   AVM's headers and has a C probe run AVM's own `av2_setup_past_independence`
   for every base_qindex bucket and `reduced_tx_part_set`. The generated tables
   (171 CDF fields, 17,513 values) are checked in. The generator refuses an AVM
   tree that is dirty or not at v1.0.0.
 - **Tiles.** Each tile's bytes (tile-size fields included) and the frame
-  context it starts from. On all 55 stills, the tiles sit where AVM puts them,
+  context it starts from. On all 57 stills, the tiles sit where AVM puts them,
   and the starting context matches AVM's `FRAME_CONTEXT` byte for byte.
+- **The tile parse.** Every symbol in a still: partitions (with the
+  semi-decoupled luma and chroma trees AV2 uses at 64x64), mode info (intra
+  modes, CFL and MHCCP, MRL, FSC, palette, intra block copy and its vector,
+  segment ids, CDEF, CCSO and GDF flags), transform types (with the IST
+  secondary transform and CCTX), and every coefficient (end of block, base
+  and low-range levels, signs, Golomb-Rice high ranges, TCQ states, parity
+  hiding, and the forward-skip path for identity transforms). AVM interleaves
+  coefficients with modes block by block, so this step can't stop short of
+  them. `av2-check --trace` diffs it against pristine AVM built with
+  `CONFIG_ACCOUNTING`, which logs every symbol AVM reads with its value,
+  coding mode, cost in 1/65536 bits and block. On all 57 stills, all 5,614,124
+  symbols match, across 107 of AVM's read sites. `rust/gen/defs.ts` takes
+  the enums, `#define`s and lookup tables the parse needs (scan orders
+  included) out of AVM the way `cdf.ts` takes the CDFs.
 
 The pixels don't match yet, because nothing is reconstructed. Next comes
-partition and mode parsing, then coefficients and dequantization (TCQ, parity
-hiding), inverse transforms (IST, CCTX), intra prediction with CFL, then
-deblocking, CDEF, CCSO, GDF and loop restoration.
+dequantization, the inverse transforms (IST and CCTX included), intra
+prediction with CFL and intra block copy, then deblocking, CDEF, CCSO, GDF
+and loop restoration.
 
 ```bash
 rust/ci.sh                    # fmt, cargo test, clippy -D warnings
-rust/oracle/build.sh          # pristine AVM, decoder only, plus av2oracle
-bun rust/corpus.ts            # 55 stills into rust/build/corpus (needs --tuned)
+rust/oracle/build.sh          # pristine AVM, decoder only, plus av2oracle and av2trace
+bun rust/corpus.ts            # 57 stills into rust/build/corpus (needs --tuned)
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --headers rust/build/corpus
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --entropy 300
-bun rust/cdf/gen.ts           # regenerate the CDF tables (after oracle/build.sh)
+cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --trace --coverage rust/build/corpus
+bun rust/gen/cdf.ts           # regenerate the CDF tables (after oracle/build.sh)
+bun rust/gen/defs.ts          # regenerate AVM's constants and lookup tables
 ```
 
 `av2oracle` decodes with AVM as built. It reads the parsed headers, tile
@@ -123,8 +142,18 @@ still fails the run. The corpus is the fixture frame at 8 and 10 bits,
 4:2:0 and 4:4:4, qp 40, 105 and 180, at speed 6 plain, with `tool-unlock=6`,
 with qmseg and with both. Four full frames add 2x2 tiles at 64, 128 and 256px
 superblocks, and three more crops add 64px superblocks (alone and tiled) and
-`reduced-tx-part-set`. A rerun of `corpus.ts` reproduces every file byte for
-byte.
+`reduced-tx-part-set`. Two more switch trellis quantization off, which drops
+TCQ from the sequence header: for a still, AVM forces TCQ on whenever the
+sequence allows it, and parity hiding only runs without it. A rerun of
+`corpus.ts` reproduces every file byte for byte.
+
+`av2trace` is the second oracle: the same pristine source with
+`CONFIG_ACCOUNTING`, a stock build option. `av2-check --trace` names the
+first symbol where the two parses part ways by the AVM function and line that
+read it, and `--coverage` lists every read site the corpus reached. Four
+stills keep `av2trace --digest`'s symbol count and hash in
+`rust/av2-tone/tests/fixtures`, so `cargo test` checks the whole parse
+without AVM installed.
 
 ## Numbers so far
 

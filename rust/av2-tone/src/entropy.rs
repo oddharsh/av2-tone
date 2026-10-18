@@ -99,6 +99,34 @@ fn tell_frac(nbits_total: u32, mut rng: u32) -> u64 {
     nbits.wrapping_sub(l)
 }
 
+/// AVM's SYMBOL_CODING_MODE (av2/decoder/accounting.h).
+pub const SYMBOL_BIT: u8 = 0;
+pub const SYMBOL_BIT_BYPASS: u8 = 1;
+pub const SYMBOL_LITERAL_BYPASS: u8 = 2;
+pub const SYMBOL_UNARY: u8 = 3;
+pub const SYMBOL_CDF: u8 = 4;
+
+/// One read, as AVM's accounting build records it: where (the block's mi
+/// position and tree), how it was coded, the value, and its cost in 1/65536
+/// bits since the previous record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceSym {
+    pub x: i32,
+    pub y: i32,
+    pub tree: u8,
+    pub mode: u8,
+    pub value: i32,
+    pub bits: u64,
+}
+
+/// A symbol-by-symbol record of a tile's parse, to diff against AVM's.
+#[derive(Debug, Clone, Default)]
+pub struct Trace {
+    pub syms: Vec<TraceSym>,
+    ctx: (i32, i32, u8),
+    last: u64,
+}
+
 /// AVM's avm_reader over od_ec_dec, for one tile.
 #[derive(Debug, Clone)]
 pub struct SymbolReader<'a> {
@@ -111,6 +139,7 @@ pub struct SymbolReader<'a> {
     cnt: i32,
     /// Adapt CDFs after each symbol (!disable_cdf_update).
     pub allow_update_cdf: bool,
+    trace: Option<Box<Trace>>,
 }
 
 impl<'a> SymbolReader<'a> {
@@ -124,10 +153,48 @@ impl<'a> SymbolReader<'a> {
             rng: 0x8000,
             cnt: -15,
             allow_update_cdf,
+            trace: None,
         };
         d.tell_offs = d.cnt + 1;
         d.refill();
         d
+    }
+
+    /// Starts recording every read, as AVM's accounting does from the
+    /// moment a tile's reader is set up.
+    pub fn enable_trace(&mut self) {
+        let last = self.tell_frac();
+        self.trace = Some(Box::new(Trace { last, ..Trace::default() }));
+    }
+
+    /// avm_accounting_set_context: the block the next reads belong to.
+    pub fn set_trace_context(&mut self, mi_col: i32, mi_row: i32, tree: u8) {
+        if let Some(t) = self.trace.as_mut() {
+            t.ctx = (mi_col, mi_row, tree);
+        }
+    }
+
+    /// The block the next reads will be recorded against.
+    pub fn trace_context(&self) -> Option<(i32, i32, u8)> {
+        self.trace.as_ref().map(|t| t.ctx)
+    }
+
+    /// The reads recorded so far.
+    pub fn take_trace(&mut self) -> Vec<TraceSym> {
+        self.trace.as_mut().map(|t| std::mem::take(&mut t.syms)).unwrap_or_default()
+    }
+
+    /// avm_process_accounting.
+    fn record(&mut self, mode: u8, value: u32) {
+        let now = match &self.trace {
+            Some(_) => self.tell_frac(),
+            None => return,
+        };
+        if let Some(t) = self.trace.as_mut() {
+            let (x, y, tree) = t.ctx;
+            t.syms.push(TraceSym { x, y, tree, mode, value: value as i32, bits: now.wrapping_sub(t.last) });
+            t.last = now;
+        }
     }
 
     /// od_ec_dec_refill: load whole bytes into the window; past the end, act
@@ -194,7 +261,9 @@ impl<'a> SymbolReader<'a> {
             return Err(Error::Invalid("CDF not decreasing"));
         }
         let dif = self.dif.wrapping_sub(u64::from(v) << (WINDOW - 16));
-        self.normalize(dif, u - v, ret)
+        let s = self.normalize(dif, u - v, ret)?;
+        self.record(SYMBOL_CDF, s as u32);
+        Ok(s)
     }
 
     /// avm_read_symbol: a symbol, then adapt the CDF if the frame allows it.
@@ -224,7 +293,9 @@ impl<'a> SymbolReader<'a> {
             return Err(Error::Invalid("8-bit probability"));
         }
         let p = (0x7f_ffff - (prob << 15) + prob) >> 8;
-        self.read_bool_q15(p)
+        let b = self.read_bool_q15(p)?;
+        self.record(SYMBOL_BIT, u32::from(b));
+        Ok(b)
     }
 
     /// od_ec_decode_literal_bypass: 1..=8 equiprobable bits, MSB first.
@@ -247,9 +318,19 @@ impl<'a> SymbolReader<'a> {
         Ok(self.bypass_normalize(dif, n, ret))
     }
 
-    /// avm_read_bit.
+    /// avm_read_bypass: one bypass bit.
+    pub fn read_bypass(&mut self) -> Result<bool> {
+        let b = self.bypass(1)?;
+        self.record(SYMBOL_BIT_BYPASS, b);
+        Ok(b == 1)
+    }
+
+    /// avm_read_bit. AVM's accounting records it twice: once inside
+    /// avm_read_bypass and again here, at no cost.
     pub fn read_bit(&mut self) -> Result<bool> {
-        Ok(self.bypass(1)? == 1)
+        let b = self.read_bypass()?;
+        self.record(SYMBOL_BIT_BYPASS, u32::from(b));
+        Ok(b)
     }
 
     /// avm_read_literal: up to 32 bits, MSB first, in 8-bit bypass chunks.
@@ -264,6 +345,7 @@ impl<'a> SymbolReader<'a> {
             v = (v << n) | u64::from(self.bypass(n)?);
             left -= n;
         }
+        self.record(SYMBOL_LITERAL_BYPASS, v as u32);
         Ok(v as u32)
     }
 
@@ -290,7 +372,9 @@ impl<'a> SymbolReader<'a> {
                 break;
             }
         }
-        Ok(self.bypass_normalize(dif, consumed, ret))
+        let v = self.bypass_normalize(dif, consumed, ret);
+        self.record(SYMBOL_UNARY, v);
+        Ok(v)
     }
 
     /// avm_od_ec_dec_tell: whole bits consumed, rounded up.
