@@ -35,6 +35,8 @@ pub struct Obu<'a> {
     pub header: ObuHeader,
     /// The bytes after the header, up to obu_size.
     pub payload: &'a [u8],
+    /// Where the payload starts in the stream, in bytes.
+    pub offset: usize,
 }
 
 /// leb128() as avm_uleb_decode reads it: at most 8 bytes, at most 2^32 - 1.
@@ -73,10 +75,11 @@ fn header(data: &[u8]) -> Result<(ObuHeader, usize)> {
 /// Splits a stream into OBUs. Stops at the first framing error.
 pub struct Obus<'a> {
     rest: &'a [u8],
+    consumed: usize,
 }
 
 pub fn obus(data: &[u8]) -> Obus<'_> {
-    Obus { rest: data }
+    Obus { rest: data, consumed: 0 }
 }
 
 impl<'a> Iterator for Obus<'a> {
@@ -92,8 +95,10 @@ impl<'a> Iterator for Obus<'a> {
             let body = self.rest.get(n..n + size).ok_or(Error::Truncated("OBU"))?;
             let (h, hlen) = header(body)?;
             let payload = body.get(hlen..).ok_or(Error::Invalid("obu_size smaller than its header"))?;
+            let offset = self.consumed + n + hlen;
             self.rest = self.rest.get(n + size..).unwrap_or_default();
-            Ok(Obu { header: h, payload })
+            self.consumed += n + size;
+            Ok(Obu { header: h, payload, offset })
         })();
         if r.is_err() {
             self.rest = &[];
@@ -127,6 +132,7 @@ mod tests {
         assert_eq!(v[2].header.obu_type, OBU_CLOSED_LOOP_KEY);
         assert_eq!((v[2].header.mlayer_id, v[2].header.xlayer_id), (1, 2));
         assert_eq!(v[2].payload, &[0xcc]);
+        assert_eq!((v[1].offset, v[2].offset), (4, 9));
     }
 
     #[test]

@@ -19,7 +19,7 @@ can move when the pin does.
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
 | `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
 | `demo/` | encodes your photo as AV1 and AV2 at the same byte count, races the encoders and the decoders (AVM, the fast decoder, dav2d, dav1d) on it, and shows both images on a local page |
-| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and the harness that checks it against pristine AVM on every file of a 53-still corpus. It parses headers so far; reconstruction comes next |
+| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and the harness that checks it against pristine AVM on every file of a 55-still corpus. It parses headers and sets up each tile's entropy decoder so far; reconstruction comes next |
 
 ## Build
 
@@ -66,9 +66,10 @@ way everything else here is. It has three rules.
   AVM would longjmp out. Clippy refuses unchecked indexing, `unwrap`, `expect`
   and `panic!` in the decoder.
 - **A panic is a bug.** Malformed input ends in `Truncated`, `Invalid` or
-  `Unsupported`, never a crash. `cargo test` cuts two real stills at every
-  length and flips every bit of their headers to hold it to that, and the
-  harness reports any panic as a failure.
+  `Unsupported`, never a crash. `cargo test` cuts three real stills at every
+  length and flips every bit of their headers and tile-size fields to hold it
+  to that, then reads each tile until it runs out of bytes. The harness
+  reports any panic as a failure.
 
 The scope is one intra key frame in a single-picture sequence: what this
 repo's encoder writes for a still at speed 6, with `tool-unlock=6` and
@@ -76,31 +77,54 @@ aadhar.sh's qmseg flags. Anything outside it is refused as `Unsupported`
 with the feature named (multi-frame headers, film grain, loop restoration,
 quantization-matrix OBUs, more than one tile group) rather than misread.
 
-Built so far: the AVIF container, OBU framing, the sequence header and the
-key frame's header, tile grid included. On all 53 stills in the corpus, every
-parsed field matches AVM's, down to the header's length in bits. The pixels
-don't match yet, because nothing is reconstructed. The plan from here follows
-the pipeline: entropy decoding and CDFs, partitions and modes, coefficients
-and dequantization (TCQ, parity hiding), inverse transforms (IST, CCTX), intra
-prediction with CFL, then deblocking, CDEF, CCSO, GDF and loop restoration.
+Built so far, in pipeline order:
+
+- **Headers.** The AVIF container, OBU framing, the sequence header and the
+  key frame's header, tile grid included. On all 55 stills in the corpus,
+  every parsed field matches AVM's, down to the header's length in bits.
+- **The entropy decoder.** AVM's multi-symbol arithmetic decoder (`entdec.c`),
+  its bool, literal, bypass and unary reads, `tell` and `tell_frac`, and AV2's
+  CDF adaptation. In AV2, unlike AV1, each CDF carries its own counter and
+  three per-interval rates. `av2-check --entropy` has AVM's own encoder
+  (`entenc.c`) write random streams over every alphabet size from 2 to 16,
+  with adaptation on and off. The Rust decoder must recover every symbol,
+  match AVM's `tell` after every operation, and end with AVM's CDFs. On 300
+  streams (1.2 million operations), it does.
+- **The default CDFs.** `rust/cdf/gen.ts` reads `FRAME_CONTEXT`'s layout out of
+  AVM's headers and has a C probe run AVM's own `av2_setup_past_independence`
+  for every base_qindex bucket and `reduced_tx_part_set`. The generated tables
+  (171 CDF fields, 17,513 values) are checked in. The generator refuses an AVM
+  tree that is dirty or not at v1.0.0.
+- **Tiles.** Each tile's bytes (tile-size fields included) and the frame
+  context it starts from. On all 55 stills, the tiles sit where AVM puts them,
+  and the starting context matches AVM's `FRAME_CONTEXT` byte for byte.
+
+The pixels don't match yet, because nothing is reconstructed. Next comes
+partition and mode parsing, then coefficients and dequantization (TCQ, parity
+hiding), inverse transforms (IST, CCTX), intra prediction with CFL, then
+deblocking, CDEF, CCSO, GDF and loop restoration.
 
 ```bash
 rust/ci.sh                    # fmt, cargo test, clippy -D warnings
 rust/oracle/build.sh          # pristine AVM, decoder only, plus av2oracle
-bun rust/corpus.ts            # 53 stills into rust/build/corpus (needs --tuned)
+bun rust/corpus.ts            # 55 stills into rust/build/corpus (needs --tuned)
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --headers rust/build/corpus
+cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --entropy 300
+bun rust/cdf/gen.ts           # regenerate the CDF tables (after oracle/build.sh)
 ```
 
-`av2oracle` decodes with AVM as built, reads the parsed headers out of AVM's
-own structs (it borrows the decoder through AVM's public thread-worker hook,
-so AVM needs no patch), and writes the planes as raw 16-bit samples.
-`av2-check` diffs the headers field by field and the planes sample by sample,
-printing the first difference as (plane, x, y). `--headers` lets only the
-header check fail the run while reconstruction is being built; without it,
-any differing sample fails. The corpus is the fixture frame at 8 and 10 bits,
+`av2oracle` decodes with AVM as built. It reads the parsed headers, tile
+buffers and starting `FRAME_CONTEXT` out of AVM's own structs: it borrows the
+decoder through AVM's public thread-worker hook, so AVM needs no patch. It
+also writes the planes as raw 16-bit samples. `av2-check` diffs all of it, and
+prints the first pixel difference as (plane, x, y). `--headers` lets pixel
+differences through while reconstruction is being built; every other check
+still fails the run. The corpus is the fixture frame at 8 and 10 bits,
 4:2:0 and 4:4:4, qp 40, 105 and 180, at speed 6 plain, with `tool-unlock=6`,
-with qmseg and with both. Five full frames add 2x2 tiles at 64, 128 and 256px
-superblocks. A rerun of `corpus.ts` reproduces every file byte for byte.
+with qmseg and with both. Four full frames add 2x2 tiles at 64, 128 and 256px
+superblocks, and three more crops add 64px superblocks (alone and tiled) and
+`reduced-tx-part-set`. A rerun of `corpus.ts` reproduces every file byte for
+byte.
 
 ## Numbers so far
 

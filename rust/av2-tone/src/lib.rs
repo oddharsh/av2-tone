@@ -8,18 +8,25 @@
 //! Scope, for now: one intra key frame in a single-picture sequence, the
 //! stream this repo's encoder writes for a still. Anything else is refused
 //! with [`Error::Unsupported`] naming what it was. Built so far: the AVIF
-//! container, OBU framing, the sequence header and the key frame's header.
-//! Reconstruction comes next, in pipeline order.
+//! container, OBU framing, the sequence header and the key frame's header,
+//! the arithmetic decoder with AVM's CDF adaptation, the default CDFs
+//! (generated from AVM), and each tile's starting entropy state. Partition
+//! and mode parsing comes next, then the rest of reconstruction.
 
 #![forbid(unsafe_code)]
 
 pub mod avif;
 mod bits;
+pub mod cdf;
+#[rustfmt::skip]
+pub mod cdf_tables;
 pub mod dump;
+pub mod entropy;
 pub mod error;
 pub mod frame;
 pub mod obu;
 pub mod seq;
+pub mod tile;
 
 pub use error::{Error, Result};
 pub use frame::FrameHeader;
@@ -50,9 +57,18 @@ impl Headers {
     }
 }
 
+/// The tile data of the key frame's tile group: everything in the OBU after
+/// its tile-group header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileGroup<'a> {
+    pub data: &'a [u8],
+    /// Where `data` starts in the OBU stream, in bytes.
+    pub offset: usize,
+}
+
 /// Parses an OBU stream (a temporal unit holding one still) up to the first
-/// tile's data. Returns the headers and the tile-group payload they precede.
-pub fn parse_obus(stream: &[u8]) -> Result<(Headers, &[u8])> {
+/// tile's data. Returns the headers and the tile data they precede.
+pub fn parse_obus(stream: &[u8]) -> Result<(Headers, TileGroup<'_>)> {
     let mut seq: Option<SequenceHeader> = None;
     for obu in obu::obus(stream) {
         let obu = obu?;
@@ -67,8 +83,9 @@ pub fn parse_obus(stream: &[u8]) -> Result<(Headers, &[u8])> {
             obu::OBU_CLOSED_LOOP_KEY => {
                 let seq = seq.ok_or(Error::Invalid("key frame before any sequence header"))?;
                 let frame = FrameHeader::parse(&seq, obu.header.obu_type, obu.payload)?;
-                let tiles = obu.payload.get(frame.tile_data_offset..).ok_or(Error::Truncated("tile group"))?;
-                return Ok((Headers { seq, frame }, tiles));
+                let data = obu.payload.get(frame.tile_data_offset..).ok_or(Error::Truncated("tile group"))?;
+                let offset = obu.offset + frame.tile_data_offset;
+                return Ok((Headers { seq, frame }, TileGroup { data, offset }));
             }
             obu::OBU_QUANTIZATION_MATRIX => return Err(Error::Unsupported("quantization matrix OBUs")),
             obu::OBU_FILM_GRAIN_MODEL => return Err(Error::Unsupported("film grain OBUs")),
@@ -108,12 +125,16 @@ impl Picture {
 
 /// Decodes an OBU stream to a picture.
 ///
-/// Reconstruction isn't built yet: the headers are parsed and checked, and
-/// every sample comes back as mid-grey, 1 << (bit_depth - 1), the value AVM
+/// Reconstruction isn't built yet: the headers are parsed and checked, the
+/// tiles are split and their entropy state set up, and every sample comes back
+/// as mid-grey, 1 << (bit_depth - 1), the value AVM
 /// fills a plane with before anything is decoded into it. The oracle harness
 /// reports where that first differs from AVM.
 pub fn decode_obus(stream: &[u8]) -> Result<(Headers, Picture)> {
-    let (headers, _tiles) = parse_obus(stream)?;
+    let (headers, group) = parse_obus(stream)?;
+    // Each tile's bytes and starting entropy state. Nothing reads symbols from
+    // them yet, but a tile layout that doesn't fit the OBU fails here.
+    let _tiles = tile::init_tiles(&headers, group.data)?;
     let (width, height) = headers.output_size();
     let s = &headers.seq;
     let mut pic = Picture {

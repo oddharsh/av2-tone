@@ -12,10 +12,12 @@
 //
 // That's 48 crops of 250x186, a size that is a multiple of neither 8 nor the
 // 128px superblock, placed so it crosses all four of the fixture's quadrants
-// and the edge of its disc, all with aadhar.sh's 128px superblocks. Five full
+// and the edge of its disc, all with aadhar.sh's 128px superblocks. Four full
 // 600x600 frames cover the tile grid: one at the shipped config, then 2x2
 // tiles at superblock sizes 64, 128 and 256 (a key frame codes 256 as 128,
-// which scales the grid), and one 8-bit 4:2:0 crop at 64.
+// which scales the grid). Three more crops: 8-bit 4:2:0 at 64px superblocks,
+// alone and in 2x2 tiles, and one with reduced-tx-part-set, the one sequence
+// flag the default CDFs depend on. 55 files in all.
 //
 // Deterministic: the fixture is seeded, the crop is fixed, 8-bit is the 10-bit
 // sample rounded once, and 4:2:0 chroma is the rounded mean of each 2x2.
@@ -147,6 +149,14 @@ fullJob("full-10b444-shipped-qp105", "shipped", [...SB128, ...CONFIGS.shipped]);
 fullJob("full-10b444-shipped-qp105-tiles2x2", "shipped", [...SB128, ...TILES2X2, ...CONFIGS.shipped]);
 fullJob("full-10b444-base-qp105-sb64-tiles2x2", "base", ["-a", "sb-size=64", ...TILES2X2]);
 fullJob("full-10b444-base-qp105-sb256-tiles2x2", "base", ["-a", "sb-size=256", ...TILES2X2]);
+jobs.push({
+  name: "crop-10b420-base-qp105-rtps", src: path.join(work, "crop-10b420.y4m"), depth: 10, qp: 105, config: "base",
+  args: [...BASE, ...SB128, "-d", "10", "-a", "qp=105", "-a", "reduced-tx-part-set=1"],
+});
+jobs.push({
+  name: "crop-8b420-base-qp180-sb64-tiles2x2", src: path.join(work, "crop-8b420.y4m"), depth: 8, qp: 180, config: "base",
+  args: [...BASE, "-a", "sb-size=64", ...TILES2X2, "-d", "8", "-a", "qp=180"],
+});
 jobs.push({
   name: "crop-8b420-base-qp105-sb64", src: path.join(work, "crop-8b420.y4m"), depth: 8, qp: 105, config: "base",
   args: [...BASE, "-a", "sb-size=64", "-d", "8", "-a", "qp=105"],

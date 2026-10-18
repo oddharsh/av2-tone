@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # build.sh: the oracle the safe-Rust decoder is checked against. Pristine AVM
 # 1.0.0, decoder only, built out of tree from the source ../../encoder/build.sh
-# fetched (never patched, never copied), and av2oracle.c linked against it.
+# fetched (never patched, never copied), and av2oracle.c linked against it,
+# with AVM's entropy encoder (avm_dsp/entenc.c) for the --entropy mode.
 #
 #   rust/oracle/build.sh     writes rust/build/av2oracle
 #
@@ -30,6 +31,8 @@ cmake -S "$AVM_SRC" -B "$OUT/avm" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DENABLE_EXAMPLES=0 -DENABLE_TESTS=0 -DENABLE_TOOLS=0 -DENABLE_DOCS=0 >"$OUT/avm.log" 2>&1 ||
   { tail -20 "$OUT/avm.log" >&2; exit 1; }
 ninja -C "$OUT/avm" avm >>"$OUT/avm.log" 2>&1 || { tail -40 "$OUT/avm.log" >&2; exit 1; }
-clang -O2 -g -Wall -Wextra -Wno-unused-parameter "$HERE/av2oracle.c" "$OUT/avm/libavm.a" \
+# entenc.c, AVM's entropy encoder, is not in a decoder-only build; the
+# --entropy mode compiles it in from the same pristine source.
+clang -O2 -g -Wall -Wextra -Wno-unused-parameter "$HERE/av2oracle.c" "$AVM_SRC/avm_dsp/entenc.c" "$OUT/avm/libavm.a" \
   -I"$AVM_SRC" -I"$OUT/avm" -o "$OUT/av2oracle" -lm -lpthread
 echo "built $OUT/av2oracle"

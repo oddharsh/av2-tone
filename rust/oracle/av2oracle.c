@@ -5,9 +5,19 @@
 //   hash <FNV-1a of the planes, as ../../fast-decode/av2bench.c hashes them>
 //   seq.* / frame.* lines  the parsed headers, read out of AVM's own structs,
 //                          in the format of ../av2-tone/src/dump.rs
+//   tile <row> <col> <offset> <size>
+//                          each tile's bytes, offset from the start of the file
+//   frame_context <hex>    the FRAME_CONTEXT every tile of the key frame
+//                          started from (cm->default_frame_context), all
+//                          sizeof(FRAME_CONTEXT) bytes
 //
 // and, given a second path, writes the cropped planes there as raw 16-bit
 // little-endian samples, Y then U then V, each plane tightly packed.
+//
+// With --entropy it checks nothing about a file. It drives AVM's own entropy
+// encoder (avm_dsp/entenc.c) over a random symbol stream, decodes the result
+// with AVM's own reader, and prints the stream, every operation, and AVM's
+// tell after each, for the Rust decoder to replay (see entropy_mode below).
 //
 // AVM keeps its decoder state behind a private struct. The shim reaches it
 // without patching AVM: it swaps in a thread-worker interface (a public AVM
@@ -15,6 +25,7 @@
 // handing the call to AVM's own. AVM is linked as built, untouched.
 //
 //   av2oracle <file.obu> [planes.bin]
+//   av2oracle --entropy <seed> <operations>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +33,9 @@
 
 #include "avm/avm_decoder.h"
 #include "avm/avmdx.h"
+#include "avm_dsp/bitreader.h"
+#include "avm_dsp/entenc.h"
+#include "avm_dsp/prob.h"
 #include "avm_util/avm_thread.h"
 #include "av2/common/av2_common_int.h"
 #include "av2/decoder/decoder.h"
@@ -194,7 +208,178 @@ static void dump_frame(const AV2Decoder *d) {
   printf("frame.header_bits %u\n", d->uncomp_hdr_size_in_bits);
 }
 
+// ---- --entropy ------------------------------------------------------------
+// One stream: a CDF per alphabet size 2..16, random but valid (strictly
+// decreasing inverse CDF ending at 0, a random starting counter so all three
+// rate intervals come up early, random per-interval rates), then a run of
+// operations. Symbols adapt their CDF when the operation says so; the stream
+// is all-adapting, never-adapting or mixed, chosen by the seed.
+static uint32_t rng_state;
+static uint32_t rnd(void) {
+  rng_state ^= rng_state << 13;
+  rng_state ^= rng_state >> 17;
+  rng_state ^= rng_state << 5;
+  return rng_state;
+}
+static int below(int n) { return (int)(rnd() % (uint32_t)n); }
+
+enum { OP_SYM, OP_BOOL, OP_LIT, OP_BIT, OP_UNARY };
+typedef struct {
+  int op, arg, adapt, value;
+} Op;
+
+static void random_cdf(avm_cdf_prob *cdf, int n) {
+  int w[16], total = 0;
+  const int shape = below(3);
+  for (int i = 0; i < n; i++) {
+    w[i] = 1 + below(shape == 0 ? 64 : shape == 1 ? 4 : 1024);
+    total += w[i];
+  }
+  if (shape == 2) {  // one symbol nearly certain
+    w[below(n)] += 40 * total;
+    total = 0;
+    for (int i = 0; i < n; i++) total += w[i];
+  }
+  int c = 0, cum = 0;
+  for (int i = 0; i < n - 1; i++) {
+    cum += w[i];
+    int next = (int)((int64_t)cum * CDF_PROB_TOP / total);
+    if (next <= c) next = c + 1;
+    if (next > CDF_PROB_TOP - (n - 1 - i)) next = CDF_PROB_TOP - (n - 1 - i);
+    c = next;
+    cdf[i] = AVM_ICDF(c);
+  }
+  cdf[n - 1] = 0;
+  cdf[n] = below(3) ? 0 : below(33);
+  for (int k = 1; k <= 3; k++) cdf[n + k] = below(7);
+}
+
+// A symbol drawn from the CDF half the time, uniform the other half, so both
+// likely and unlikely symbols get coded.
+static int pick(const avm_cdf_prob *cdf, int n) {
+  if (below(2)) return below(n);
+  const int x = below(CDF_PROB_TOP);
+  for (int s = 0; s < n - 1; s++)
+    if (x < CDF_PROB_TOP - cdf[s]) return s;
+  return n - 1;
+}
+
+static int entropy_mode(uint32_t seed, int nops) {
+  rng_state = seed * 2654435761u + 1;
+  avm_cdf_prob enc_cdf[17][CDF_SIZE(16)], dec_cdf[17][CDF_SIZE(16)];
+  for (int n = 2; n <= 16; n++) random_cdf(enc_cdf[n], n);
+  memcpy(dec_cdf, enc_cdf, sizeof(enc_cdf));
+  const int adapt_mode = seed % 3;  // 0 always, 1 never, 2 mixed
+  Op *ops = calloc((size_t)nops, sizeof(*ops));
+  if (!ops) return 2;
+
+  od_ec_enc enc;
+  avm_od_ec_enc_init(&enc, 1024);
+  for (int i = 0; i < nops; i++) {
+    Op *o = &ops[i];
+    const int r = below(100);
+    o->op = r < 70 ? OP_SYM : r < 80 ? OP_BOOL : r < 88 ? OP_LIT : r < 94 ? OP_BIT : OP_UNARY;
+    switch (o->op) {
+      case OP_SYM:
+        o->arg = 2 + below(15);
+        o->adapt = adapt_mode == 0 ? 1 : adapt_mode == 1 ? 0 : below(2);
+        o->value = pick(enc_cdf[o->arg], o->arg);
+        avm_od_ec_encode_cdf_q15(&enc, o->value, enc_cdf[o->arg], o->arg);
+        if (o->adapt) update_cdf(enc_cdf[o->arg], o->value, o->arg);
+        break;
+      case OP_BOOL: {  // avm_write's 8-bit probability
+        o->arg = below(256);
+        o->value = below(2);
+        const int p = (0x7FFFFF - (o->arg << 15) + o->arg) >> 8;
+        avm_od_ec_encode_bool_q15(&enc, o->value, p);
+        break;
+      }
+      case OP_LIT: {  // avm_write_literal's 8-bit chunks
+        o->arg = 1 + below(24);
+        o->value = (int)(rnd() & ((1u << o->arg) - 1));
+        int bits = o->arg, data = o->value;
+        while (bits > 0) {
+          const int n = bits >= 8 ? 8 : bits;
+          od_ec_encode_literal_bypass(&enc, data >> (bits - n), n);
+          bits -= n;
+          data &= (1 << bits) - 1;
+        }
+        break;
+      }
+      case OP_BIT:
+        o->value = below(2);
+        od_ec_encode_literal_bypass(&enc, o->value, 1);
+        break;
+      case OP_UNARY:  // value zeros, then a one unless value reached the cap
+        o->arg = 1 + below(16);
+        o->value = below(o->arg + 1);
+        for (int k = 0; k < o->value; k++) od_ec_encode_literal_bypass(&enc, 0, 1);
+        if (o->value < o->arg) od_ec_encode_literal_bypass(&enc, 1, 1);
+        break;
+    }
+  }
+  uint32_t nbytes = 0;
+  unsigned char *data = avm_od_ec_enc_done(&enc, &nbytes);
+  if (!data || enc.error) {
+    fprintf(stderr, "AVM's encoder failed\n");
+    return 1;
+  }
+
+  printf("entropy %u %u %d\ndata ", seed, nbytes, nops);
+  for (uint32_t i = 0; i < nbytes; i++) printf("%02x", data[i]);
+  printf("\n");
+  for (int n = 2; n <= 16; n++) {
+    printf("cdf %d", n);
+    for (int k = 0; k < CDF_SIZE(n); k++) printf(" %u", dec_cdf[n][k]);
+    printf("\n");
+  }
+  avm_reader r;
+  if (avm_reader_init(&r, data, nbytes)) return 1;
+  for (int i = 0; i < nops; i++) {
+    const Op *o = &ops[i];
+    int v = -1;
+    switch (o->op) {
+      case OP_SYM:
+        r.allow_update_cdf = (uint8_t)o->adapt;
+        v = avm_read_symbol(&r, dec_cdf[o->arg], o->arg, 0);
+        printf("op sym %d %d", o->arg, o->adapt);
+        break;
+      case OP_BOOL:
+        v = avm_read(&r, o->arg, 0);
+        printf("op bool %d", o->arg);
+        break;
+      case OP_LIT:
+        v = avm_read_literal(&r, o->arg, 0);
+        printf("op lit %d", o->arg);
+        break;
+      case OP_BIT:
+        v = avm_read_bit(&r, 0);
+        printf("op bit");
+        break;
+      case OP_UNARY:
+        v = avm_read_unary(&r, o->arg, 0);
+        printf("op unary %d", o->arg);
+        break;
+    }
+    if (v != o->value) {
+      fprintf(stderr, "AVM decoded %d at operation %d, encoded %d\n", v, i, o->value);
+      return 1;
+    }
+    printf(" %d %u %llu\n", v, avm_reader_tell(&r), (unsigned long long)avm_reader_tell_frac(&r));
+  }
+  for (int n = 2; n <= 16; n++) {
+    printf("final %d", n);
+    for (int k = 0; k < CDF_SIZE(n); k++) printf(" %u", dec_cdf[n][k]);
+    printf("\n");
+  }
+  printf("end\n");
+  avm_od_ec_enc_clear(&enc);
+  free(ops);
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc == 4 && !strcmp(argv[1], "--entropy")) return entropy_mode((uint32_t)strtoul(argv[2], NULL, 10), atoi(argv[3]));
   if (argc < 2) {
     fprintf(stderr, "usage: av2oracle <file.obu> [planes.bin]\n");
     return 2;
@@ -275,6 +460,17 @@ int main(int argc, char **argv) {
   printf("hash %016llx\n", (unsigned long long)h);
   dump_seq(&pbi->common.seq_params);
   dump_frame(pbi);
+  const AV2_COMMON *cm = &pbi->common;
+  for (int r = 0; r < cm->tiles.rows; r++)
+    for (int c = 0; c < cm->tiles.cols; c++)
+      printf("tile %d %d %td %zu\n", r, c, pbi->tile_buffers[r][c].data - buf, pbi->tile_buffers[r][c].size);
+  // On a key frame every tile copies cm->fc after av2_setup_past_independence,
+  // which leaves the same values in cm->default_frame_context. cm->fc itself
+  // holds the adapted CDFs once decoding ends, so it is not dumped.
+  const uint8_t *fc = (const uint8_t *)cm->default_frame_context;
+  printf("frame_context ");
+  for (size_t i = 0; i < sizeof(FRAME_CONTEXT); i++) printf("%02x", fc[i]);
+  printf("\n");
   avm_codec_destroy(&ctx);
   free(buf);
   return 0;
