@@ -231,6 +231,38 @@ Measured on an M3 Max with other work running, so read them as approximate.
   unused level adds the OBU and leaves every pixel alone, which the build
   gate checks. `avmenc --test-decode` passes on AVM's own matrices and on a
   steeper set.
+- **jpegli seg-maps (patch 0010), 2026-10-18.** jpegli scales each 8x8
+  block's quantizer step by 1/qf, its masking field, which on AV2's table (24
+  qindex an octave) is an offset of -24 * s * log2(qf / geomean(qf)): texture
+  goes coarser, flat areas finer. The 8x8 field spreads 0.12 to 0.30 in log2
+  standard deviation across the 8 dense crops, so at jpegli's own scaling
+  (s = 1) the offsets span about +-5 to +-16 qindex. A seg-map replaces qmseg,
+  so each map also carries qmseg's QM split: levels whose blocks are mostly
+  textured (qf < 0.45) take qmseg's level-12 QM. Offsets are quantized to a
+  few evenly spaced levels, numbered finest first since a block takes the
+  smallest id under it. Same crops, 4 qps, speed 6 with `tool-unlock=6`,
+  BD-rate against the shipping qmseg config (positive is bigger files):
+
+  | seg-map | ssimulacra2 BD-rate | crops better | butteraugli BD-rate |
+  |---|---|---|---|
+  | qmseg's split at 8x8, no offsets | +1.11% | 1 of 8 | +7.3% |
+  | s = 0.5, 8 levels | +2.15% | 1 of 8 | +5.8% |
+  | s = 1, 8 levels | +1.04% | 2 of 8 | +5.1% |
+  | s = 1, 8 levels, no QM split | +1.85% | 2 of 8 | +3.0% |
+  | s = 1, 16 levels (`enable-ext-seg`) | +2.48% | 1 of 8 | +7.1% |
+  | s = 2, 8 levels | +0.12% | 5 of 8 | +4.6% |
+  | s = 3, 8 levels | +1.35% | 3 of 8 | +3.4% |
+  | s = 4, 8 levels | +4.85% | 2 of 8 | +11.0% |
+  | s = 2, 4 levels | -0.48% | 3 of 8 | -0.0% |
+  | s = 2, 4 levels, QM split by qmseg's 64px units | +0.34% | 3 of 8 | +2.4% |
+
+  Moving qmseg's split from 64px units to 8x8 blocks costs 1.1% on its own,
+  the price of a segment id per block. The offsets buy some of it back, most
+  at twice jpegli's own strength, and fewer levels cost less: s = 2 with 4
+  levels is the one map so far ahead of shipping on both metrics, by 0.5% on
+  ssimulacra2 with 3 crops of 8 better, within what one or two crops can
+  move. 2 and 3 levels, and the best of them on 8 held-out photos at speed
+  3, are running; this entry gets their numbers.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
