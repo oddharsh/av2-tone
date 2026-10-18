@@ -17,7 +17,10 @@
 // tiles at superblock sizes 64, 128 and 256 (a key frame codes 256 as 128,
 // which scales the grid). Three more crops: 8-bit 4:2:0 at 64px superblocks,
 // alone and in 2x2 tiles, and one with reduced-tx-part-set, the one sequence
-// flag the default CDFs depend on. 55 files in all.
+// flag the default CDFs depend on. Two more turn trellis quantization off,
+// which takes TCQ out of the sequence header: the only way a still gets
+// parity hiding, since AVM forces TCQ on for a single picture whenever the
+// sequence allows it. 57 files in all.
 //
 // Deterministic: the fixture is seeded, the crop is fixed, 8-bit is the 10-bit
 // sample rounded once, and 4:2:0 chroma is the rounded mean of each 2x2.
@@ -161,6 +164,12 @@ jobs.push({
   name: "crop-8b420-base-qp105-sb64", src: path.join(work, "crop-8b420.y4m"), depth: 8, qp: 105, config: "base",
   args: [...BASE, "-a", "sb-size=64", "-d", "8", "-a", "qp=105"],
 });
+for (const [tag, depth, qp] of [["8b420", 8, 40], ["10b444", 10, 105]] as const) {
+  jobs.push({
+    name: `crop-${tag}-base-qp${qp}-notcq`, src: path.join(work, `crop-${tag}.y4m`), depth, qp, config: "base",
+    args: [...BASE, ...SB128, "-d", String(depth), "-a", `qp=${qp}`, "-a", "enable-trellis-quant=0"],
+  });
+}
 
 // Four encodes at a time, each on four threads.
 const manifest: Record<string, { config: string; qp: number; args: string[] }> = {};

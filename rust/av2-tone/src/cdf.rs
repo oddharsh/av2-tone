@@ -1,6 +1,6 @@
 //! The frame context: every adaptive CDF a tile decodes with, laid out exactly
 //! as AVM's FRAME_CONTEXT so the two can be compared byte for byte. The
-//! fields and default values are generated from AVM by ../../cdf/gen.ts into
+//! fields and default values are generated from AVM by ../../gen/cdf.ts into
 //! cdf_tables.rs; this file only indexes into them.
 
 use crate::cdf_tables::{
@@ -88,6 +88,21 @@ impl FrameContext {
     /// Reads one symbol of `field[idx]`, adapting it if the tile allows.
     pub fn read<const R: usize>(&mut self, r: &mut SymbolReader, field: &Cdf<R>, idx: [usize; R]) -> Result<usize> {
         let nsyms = field.nsyms;
+        r.read_symbol(self.cdf_mut(field, idx)?, nsyms)
+    }
+
+    /// Reads one symbol of a packed field (cdf_tables::PACKED_ALPHABETS) over
+    /// its real alphabet, `nsyms`, no larger than the declared one.
+    pub fn read_n<const R: usize>(
+        &mut self,
+        r: &mut SymbolReader,
+        field: &Cdf<R>,
+        idx: [usize; R],
+        nsyms: usize,
+    ) -> Result<usize> {
+        if nsyms > field.nsyms {
+            return Err(Error::Invalid("alphabet larger than its CDF"));
+        }
         r.read_symbol(self.cdf_mut(field, idx)?, nsyms)
     }
 

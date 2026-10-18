@@ -312,6 +312,8 @@ pub struct Gdf {
     pub pic_scale_idx: u32,
     pub block_size: u32,
     pub block_num: u32,
+    /// Blocks per row (gdf_block_num_w), which block indices are counted in.
+    pub block_num_w: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -680,6 +682,7 @@ impl FrameHeader {
         let h: u32 = Tiles::extents(&t.row_start_sb, mib_log2, self.mi_rows).into_iter().map(blocks).sum();
         let w: u32 = Tiles::extents(&t.col_start_sb, mib_log2, self.mi_cols).into_iter().map(blocks).sum();
         g.block_num = h * w;
+        g.block_num_w = w;
         g.mode = 1; // single-picture header: GDF is on unless coded lossless
         if g.block_num > 1 {
             g.mode += u32::from(r.bit()?);

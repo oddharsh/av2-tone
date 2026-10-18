@@ -2,12 +2,14 @@
 # build.sh: the oracle the safe-Rust decoder is checked against. Pristine AVM
 # 1.0.0, decoder only, built out of tree from the source ../../encoder/build.sh
 # fetched (never patched, never copied), and av2oracle.c linked against it,
-# with AVM's entropy encoder (avm_dsp/entenc.c) for the --entropy mode.
+# with AVM's entropy encoder (avm_dsp/entenc.c) for the --entropy mode. A
+# second build of the same source turns on CONFIG_ACCOUNTING, a stock AVM
+# option that records every symbol a decode reads, for av2trace.c.
 #
-#   rust/oracle/build.sh     writes rust/build/av2oracle
+#   rust/oracle/build.sh     writes rust/build/av2oracle and rust/build/av2trace
 #
 # Needs cmake, ninja, clang, and the AVM source (../../encoder/build.sh, or
-# AVM_SRC=<dir>). The first build takes about a minute.
+# AVM_SRC=<dir>). The first build takes about two minutes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -35,4 +37,12 @@ ninja -C "$OUT/avm" avm >>"$OUT/avm.log" 2>&1 || { tail -40 "$OUT/avm.log" >&2; 
 # --entropy mode compiles it in from the same pristine source.
 clang -O2 -g -Wall -Wextra -Wno-unused-parameter "$HERE/av2oracle.c" "$AVM_SRC/avm_dsp/entenc.c" "$OUT/avm/libavm.a" \
   -I"$AVM_SRC" -I"$OUT/avm" -o "$OUT/av2oracle" -lm -lpthread
-echo "built $OUT/av2oracle"
+
+cmake -S "$AVM_SRC" -B "$OUT/avm-acct" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCONFIG_AV2_ENCODER=0 -DCONFIG_TENSORFLOW_LITE=0 -DCONFIG_MULTITHREAD=1 -DCONFIG_ACCOUNTING=1 \
+  -DENABLE_EXAMPLES=0 -DENABLE_TESTS=0 -DENABLE_TOOLS=0 -DENABLE_DOCS=0 >"$OUT/avm-acct.log" 2>&1 ||
+  { tail -20 "$OUT/avm-acct.log" >&2; exit 1; }
+ninja -C "$OUT/avm-acct" avm >>"$OUT/avm-acct.log" 2>&1 || { tail -40 "$OUT/avm-acct.log" >&2; exit 1; }
+clang -O2 -g -Wall -Wextra -Wno-unused-parameter "$HERE/av2trace.c" "$OUT/avm-acct/libavm.a" \
+  -I"$AVM_SRC" -I"$OUT/avm-acct" -o "$OUT/av2trace" -lm -lpthread
+echo "built $OUT/av2oracle and $OUT/av2trace"

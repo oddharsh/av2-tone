@@ -17,6 +17,13 @@
 //!
 //!   cargo run --release -p av2-check -- [--oracle <path>] [--headers] <dir>...
 //!   cargo run --release -p av2-check -- [--oracle <path>] --entropy <streams> [--ops <n>]
+//!   cargo run --release -p av2-check -- [--oracle <path>] --trace [--coverage] <dir>...
+//!
+//! With --trace it diffs av2-tone's tile parse against AVM's own symbol trace
+//! (av2trace, built with AVM's accounting on): every symbol's value, coding
+//! mode, cost and block must match, and the first that doesn't is named by
+//! the AVM function and line that read it. --coverage then lists every AVM
+//! read site the files reached, with its symbol count.
 //!
 //! Exits 1 on any difference, any decode error, or any panic in av2-tone (a
 //! panic is a bug: the decoder must return an error instead). --headers lets
@@ -173,6 +180,128 @@ fn diff_frame_context(headers: &av2_tone::Headers, avm: &Oracle) -> Result<usize
     Ok(ours.len() - pad.len())
 }
 
+/// AVM's symbol trace for one stream: (name, x, y, tree, mode, value, bits).
+struct AvmSym {
+    name: String,
+    s: av2_tone::entropy::TraceSym,
+}
+
+fn run_trace(bin: &Path, obu: &Path) -> Result<Vec<AvmSym>, String> {
+    let out = Command::new(bin).arg(obu).output().map_err(|e| format!("{}: {e}", bin.display()))?;
+    if !out.status.success() {
+        return Err(format!("AVM failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut names = BTreeMap::new();
+    let mut raw = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        match f.first() {
+            Some(&"name") if f.len() >= 4 => {
+                names.insert(f[1].to_string(), f[2..].join(" "));
+            }
+            Some(&"sym") if f.len() == 8 => {
+                let n = |i: usize| f[i].parse::<i64>().unwrap_or(-1);
+                raw.push((
+                    f[1].to_string(),
+                    av2_tone::entropy::TraceSym {
+                        x: n(2) as i32,
+                        y: n(3) as i32,
+                        tree: n(4) as u8,
+                        mode: n(5) as u8,
+                        value: n(6) as i32,
+                        bits: f[7].parse().unwrap_or(0),
+                    },
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(raw.into_iter().map(|(id, s)| AvmSym { name: names.get(&id).cloned().unwrap_or(id), s }).collect())
+}
+
+fn show(s: &av2_tone::entropy::TraceSym) -> String {
+    const MODES: [&str; 5] = ["bool", "bit", "literal", "unary", "cdf"];
+    format!(
+        "{} {} at mi ({}, {}) tree {}, {} bits",
+        MODES.get(s.mode as usize).unwrap_or(&"?"),
+        s.value,
+        s.x,
+        s.y,
+        s.tree,
+        s.bits as f64 / 65536.0
+    )
+}
+
+/// av2-tone's parse against AVM's symbol trace, file by file.
+fn trace(tracer: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path, coverage: bool) -> ExitCode {
+    let (mut full, mut checked, mut matched_total, mut avm_total) = (0, 0, 0usize, 0usize);
+    let mut sites: BTreeMap<String, usize> = BTreeMap::new();
+    let mut failed = false;
+    for path in files.values() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Ok(obu) = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|f| av2_tone::avif::primary_item(&f).map_err(|e| e.to_string()))
+        else {
+            continue;
+        };
+        checked += 1;
+        let obu_path = work.join("item.obu");
+        if std::fs::write(&obu_path, &obu).is_err() {
+            continue;
+        }
+        let avm = match run_trace(tracer, &obu_path) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("ERROR {name}: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        let ours = match std::panic::catch_unwind(|| av2_tone::parse::trace_obus(&obu)) {
+            Ok(t) => t,
+            Err(_) => {
+                println!("PANIC {name}: av2-tone panicked, which is a bug");
+                failed = true;
+                continue;
+            }
+        };
+        for a in &avm {
+            *sites.entry(a.name.clone()).or_default() += 1;
+        }
+        let same = ours.syms.iter().zip(&avm).take_while(|(a, b)| **a == b.s).count();
+        matched_total += same;
+        avm_total += avm.len();
+        if same == avm.len() && ours.syms.len() == avm.len() && ours.result.is_ok() {
+            full += 1;
+            println!("{name:44} all {} symbols match", avm.len());
+            continue;
+        }
+        failed = true;
+        println!("{name:44} {same} of {} symbols match", avm.len());
+        if let (Some(a), Some(o)) = (avm.get(same), ours.syms.get(same)) {
+            println!("    symbol {same}: AVM read {} ({}), av2-tone {}", a.name, show(&a.s), show(o));
+        } else if let Some(a) = avm.get(same) {
+            let why = ours.result.as_ref().err().map_or("stopped".to_string(), |e| e.to_string());
+            println!("    av2-tone {why}; AVM's next read is {} ({})", a.name, show(&a.s));
+        } else {
+            println!("    av2-tone read {} symbols past AVM's last", ours.syms.len() - same);
+        }
+    }
+    println!(
+        "{checked} files: {full} parse identically to AVM; {matched_total} of {avm_total} symbols match ({:.1}%)",
+        100.0 * matched_total as f64 / avm_total.max(1) as f64
+    );
+    if coverage {
+        for (site, n) in &sites {
+            println!("{n:>10}  {site}");
+        }
+        println!("{} AVM read sites reached", sites.len());
+    }
+    if failed || checked == 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
 fn entropy(oracle: &Path, streams: u32, ops: u32) -> ExitCode {
     let mut all = entropy_script::Coverage::default();
     let mut failed = 0;
@@ -224,12 +353,16 @@ fn main() -> ExitCode {
     let mut oracle = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../build/av2oracle"));
     let mut headers_only = false;
     let mut entropy_streams = None;
+    let mut trace_mode = false;
+    let mut coverage = false;
     let mut ops = 4000;
     let mut dirs = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--oracle" => oracle = args.next().map(PathBuf::from).unwrap_or_default(),
             "--headers" => headers_only = true,
+            "--trace" => trace_mode = true,
+            "--coverage" => coverage = true,
             "--entropy" => entropy_streams = args.next().and_then(|n| n.parse::<u32>().ok()),
             "--ops" => ops = args.next().and_then(|n| n.parse().ok()).unwrap_or(ops),
             _ => dirs.push(PathBuf::from(a)),
@@ -265,6 +398,17 @@ fn main() -> ExitCode {
                 files.insert(p.clone(), p);
             }
         }
+    }
+
+    if trace_mode {
+        let tracer = oracle.with_file_name("av2trace");
+        if !tracer.exists() {
+            eprintln!("missing {}: run rust/oracle/build.sh", tracer.display());
+            return ExitCode::from(2);
+        }
+        let code = trace(&tracer, &files, &work, coverage);
+        let _ = std::fs::remove_dir_all(&work);
+        return code;
     }
 
     let mut checked = 0;

@@ -1,15 +1,18 @@
-//! Three stills from rust/corpus.ts, frozen with what AVM made of them
-//! (av2oracle's seq.*, frame.*, tile and frame_context lines), so `cargo test`
-//! checks the header parser, the tile split and the starting CDFs against AVM
-//! without AVM installed. The full corpus runs through av2-check.
+//! Four stills from rust/corpus.ts, frozen with what AVM made of them
+//! (av2oracle's seq.*, frame.*, tile and frame_context lines, and
+//! av2trace --digest's count and hash of every symbol AVM read), so `cargo
+//! test` checks the header parser, the tile split, the starting CDFs and the
+//! whole tile parse against AVM without AVM installed. The full corpus runs
+//! through av2-check.
 //!
-//!   crop-10b444-shipped-qp180           aadhar.sh's flags: qmseg, TCQ, intra block copy
+//!   crop-10b444-shipped-qp180           aadhar.sh's flags: qmseg, TCQ, IST, CCTX, intra block copy
 //!   crop-8b420-base-qp105-sb64          64px superblocks, 8-bit 4:2:0
 //!   crop-8b420-base-qp180-sb64-tiles2x2 four tiles, so three tile-size fields
+//!   crop-10b444-base-qp105-notcq        no TCQ, so parity hiding
 //!
-//! All three also feed the robustness sweeps: every truncation and every
-//! single bit flip of the headers and the tile data must come back as Ok or
-//! Err, never a panic.
+//! All four also feed the robustness sweeps: every truncation, and every
+//! single bit flip of the headers and a sample of the tile data, must come
+//! back from the full parse as Ok or Err, never a panic.
 
 // Test code: a panic here is the assertion, not a decoder bug.
 #![allow(clippy::panic, clippy::indexing_slicing)]
@@ -17,9 +20,8 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use av2_tone::cdf::FrameContext;
-use av2_tone::cdf_tables::{Y_MODE_IDX_CDF, Y_MODE_SET_CDF};
 
-const FIXTURES: [(&str, &[u8], &str); 3] = [
+const FIXTURES: [(&str, &[u8], &str); 4] = [
     (
         "crop-10b444-shipped-qp180",
         include_bytes!("fixtures/crop-10b444-shipped-qp180.avif"),
@@ -35,6 +37,19 @@ const FIXTURES: [(&str, &[u8], &str); 3] = [
         include_bytes!("fixtures/crop-8b420-base-qp180-sb64-tiles2x2.avif"),
         include_str!("fixtures/crop-8b420-base-qp180-sb64-tiles2x2.avm.txt"),
     ),
+    (
+        "crop-10b444-base-qp105-notcq",
+        include_bytes!("fixtures/crop-10b444-base-qp105-notcq.avif"),
+        include_str!("fixtures/crop-10b444-base-qp105-notcq.avm.txt"),
+    ),
+];
+
+/// av2trace --digest for each fixture, in FIXTURES order.
+const TRACES: [&str; 4] = [
+    include_str!("fixtures/crop-10b444-shipped-qp180.trace.txt"),
+    include_str!("fixtures/crop-8b420-base-qp105-sb64.trace.txt"),
+    include_str!("fixtures/crop-8b420-base-qp180-sb64-tiles2x2.trace.txt"),
+    include_str!("fixtures/crop-10b444-base-qp105-notcq.trace.txt"),
 ];
 
 fn avm_lines<'a>(avm: &'a str, prefix: &'a str) -> impl Iterator<Item = &'a str> {
@@ -75,27 +90,28 @@ fn tiles_and_starting_cdfs_match_avm() {
     }
 }
 
+#[test]
+fn tile_parse_matches_avm_trace() {
+    for ((name, file, _), avm) in FIXTURES.iter().zip(TRACES) {
+        let obus = av2_tone::avif::primary_item(file).unwrap_or_default();
+        let t = av2_tone::parse::trace_obus(&obus);
+        if let Err(e) = &t.result {
+            panic!("{name}: {e}");
+        }
+        let ours = format!("digest {} {:016x}", t.syms.len(), av2_tone::parse::trace_digest(&t.syms));
+        assert_eq!(ours, avm.trim(), "{name}: symbols differ from AVM's; av2-check --trace names the first");
+    }
+}
+
 /// Runs `f` and turns a panic into a test failure that names the input.
 fn survives<T>(name: &str, what: &str, f: impl FnOnce() -> T) -> T {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| panic!("{name}: av2-tone panicked on {what}"))
 }
 
-/// Decodes the stream as far as av2-tone goes, then reads symbols from every
-/// tile until each has run past its bytes. Returns whether the stream parsed.
-fn decode_and_drain(obus: &[u8]) -> bool {
-    let Ok((headers, group)) = av2_tone::parse_obus(obus) else { return false };
-    let Ok(mut tiles) = av2_tone::tile::init_tiles(&headers, group.data) else { return false };
-    for t in &mut tiles {
-        let mut reads = 0;
-        while !t.reader.has_overflowed() && reads < 100_000 {
-            let _ = t.ctx.read(&mut t.reader, &Y_MODE_SET_CDF, []);
-            let _ = t.ctx.read(&mut t.reader, &Y_MODE_IDX_CDF, [reads % Y_MODE_IDX_CDF.dims[0]]);
-            let _ = t.reader.read_literal(5);
-            reads += 1;
-        }
-        assert!(t.reader.has_overflowed(), "a tile never reported running out of bytes");
-    }
-    true
+/// Decodes the stream as far as av2-tone goes: headers and every tile's
+/// symbols. Returns whether it parsed.
+fn decode(obus: &[u8]) -> bool {
+    av2_tone::decode_obus(obus).is_ok()
 }
 
 #[test]
@@ -106,7 +122,7 @@ fn every_truncation_is_an_error_not_a_panic() {
         let tiles = av2_tone::tile::tile_buffers(&headers, group.data).unwrap();
         let last_tile = group.offset + tiles.last().map_or(0, |t| t.offset);
         for n in 0..obus.len() {
-            let parsed = survives(name, &format!("the first {n} bytes"), || decode_and_drain(&obus[..n]));
+            let parsed = survives(name, &format!("the first {n} bytes"), || decode(&obus[..n]));
             // Cut in the headers, or before the last tile's first byte: the
             // layout no longer fits, as AVM's get_tile_buffers finds too.
             if n <= last_tile {
@@ -126,13 +142,16 @@ fn every_bit_flip_in_headers_and_tile_data_is_survived() {
     for (name, file, _) in FIXTURES {
         let obus = av2_tone::avif::primary_item(file).unwrap_or_default();
         let (_, group) = av2_tone::parse_obus(&obus).unwrap_or_else(|e| panic!("{name}: {e}"));
-        // Every header bit, and the first 64 bytes of tile data, which hold the
-        // tile-size fields of a multi-tile frame.
+        // Every header bit and every bit of the first 64 bytes of tile data,
+        // which hold the tile-size fields of a multi-tile frame; then every
+        // 61st bit to the end, through the partition, mode and coefficient
+        // syntax.
         let end = (group.offset + 64).min(obus.len());
+        let bits = (0..end * 8).chain((end * 8..obus.len() * 8).step_by(61));
         let mut flipped = obus.clone();
-        for bit in 0..end * 8 {
+        for bit in bits {
             flipped[bit / 8] ^= 0x80 >> (bit % 8);
-            survives(name, &format!("bit {bit} flipped"), || decode_and_drain(&flipped));
+            survives(name, &format!("bit {bit} flipped"), || decode(&flipped));
             flipped[bit / 8] ^= 0x80 >> (bit % 8);
         }
     }
