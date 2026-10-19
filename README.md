@@ -403,10 +403,27 @@ Measured on an M3 Max with other work running, so read them as approximate.
   beat that, and 0012 stays in the build because it makes a qm-file
   quantize as its matrices say.
 - **jpegli matrices at full size, 2026-10-19.** The same qm-files on whole
-  photos with 0012: 8 of the site's own 600px photos, and the two 12 MP
-  camera originals (samsung5 and samsung6), at speed 6. Each jpegli shape
-  is judged against AVM's own matrices sent the same way, so both carry the
-  OBU and only the shape differs. Results are being measured and land here.
+  photos with 0012, starting with 8 of the site's own 600px photos (their
+  shipped JPEG tiers as the source) at speed 6, BD-rate against shipping
+  qmseg. AVM's own matrices sent the same way carry the same OBU, so each
+  jpegli shape is read against that row:
+
+  | qm-file, 600px photos | ssimulacra2 BD-rate | photos better | butteraugli BD-rate | bytes against shipping |
+  |---|---|---|---|---|
+  | AVM's own matrices | +0.48% | 1 of 8 | -1.2% | +176 B |
+  | fitted, levels 8/9 and 12 | +0.60% | 1 of 8 | -2.6% | -152 B |
+  | fitted, level 12 only | +0.35% | 0 of 8 | 0.0% | -16 B |
+  | alpha 0.5 | +4.55% | 0 of 8 | +1.0% | +971 B |
+
+  These encodes average 47 KB across the four qps, so the OBU costs 0.5%
+  here against 1.5% on the 320px crops. The fitted shape reads +0.12%
+  against AVM's own matrices on ssimulacra2 and 1.5 points better on
+  butteraugli, while single photos swing 1.5% and 10%: a tie. Level 12
+  alone comes closest to shipping because two of the photos have no
+  textured units and encode exactly as shipping does; it trails on the
+  other six. Alpha 0.5 loses on every photo. The same arms at speed 3 and
+  on the two 12 MP camera originals (samsung5 and samsung6) are running
+  and land here.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
