@@ -13,7 +13,7 @@ can move when the pin does.
 
 | dir | what it does |
 |---|---|
-| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: eleven encoder patches and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
+| `encoder/` | builds libavif with AVM 1.0.0 at a pinned commit, plus a tuned build: twelve encoder patches (plus one experiment in `encoder/experiments/`) and AVM's AVX2 kernels compiled for arm64 through [SIMDe](https://github.com/simd-everywhere/simde) |
 | `fast-decode/` | a native AV2 decoder for this machine: AVM plus NEON GDF, GDF across cores, and deblocking behind reconstruction, checked bit for bit against pristine AVM |
 | `wasm/` | compiles AVM's decoder to a standalone WebAssembly module with no Emscripten glue (1.76 MB, about 430 KB Brotli) |
 | `metal/` | AV2's GDF loop filter on the Apple GPU, checked against AVM's own C kernels |
@@ -324,10 +324,10 @@ Measured on an M3 Max with other work running, so read them as approximate.
   | jpegli, alpha 1 | +7.37% | 0 of 8 | +12.2% |
   | jpegli, alpha 0.5, its distance-3 shape | +5.02% | 0 of 8 | +9.2% |
 
-  Sending AVM's own matrices back costs 1.4%: the QM OBU (about 100 to 250 B
-  against 10 to 25 KB crops) and the 4x4 matrices AV2 derives from the 8x8,
-  which differ from AVM's built-in ones. Every jpegli shape loses beyond
-  that, more the steeper it is. The reason shows when AVM's matrices are
+  Sending AVM's own matrices back costs 1.4%, almost all of it the QM OBU
+  (118 B for one level, 182 B for two, against 6 to 35 KB crops; see the
+  entry below). Every jpegli shape loses beyond that, more the steeper it
+  is. The reason shows when AVM's matrices are
   read as a function of frequency (index k of an N-point transform at
   k / 2N cycles a pixel): its 8x8 and its 32x32 agree to 0.07 octaves rms,
   one curve across sizes, and since a qm-file reaches only the transforms up
@@ -361,12 +361,45 @@ Measured on an M3 Max with other work running, so read them as approximate.
   | fitted, level 12 only | +0.56% | 1 of 8 | -1.0% |
   | fitted, levels 8/9 and 12 | +2.65% | 1 of 8 | +0.3% |
 
-  The null file costs the samsung5 camera photo 8.3%, the most of any
-  photo, which points at the derived 4x4 matrices: a detailed crop codes
-  many 4x4 transforms. No jpegli shape beats AVM's matrices, and the cost of
-  sending any matrix at all (that 4x4 mismatch plus the OBU) is larger than
-  what a shape could buy here. Letting a qm-file set the 4x4 matrix too
-  would isolate the shape from that cost; nothing ships from this.
+  No jpegli shape beats AVM's matrices, and none recovers the cost of
+  sending a matrix at all. The null file costs the samsung5 camera photo
+  8.3%, the most of any photo; the entry below shows that is its OBU on a
+  file of a few KB at qp 125, not the matrices. Nothing ships from this.
+- **What a qm-file costs (patches 0012 and 0013), 2026-10-19.** Two things
+  separate a qm-file of AVM's own matrices from AVM's built-in ones besides
+  the OBU. For a user matrix AVM computes the encoder's forward weights as
+  1024 / iwt truncated, while every one of its predefined weights is that
+  rounded (162,000 of 162,000), so 38% of entries came out different and AVM's
+  own matrices quantized differently. Patch 0012 rounds; the decoder
+  dequantizes with iwt alone, so the output stays standard AV2 and the
+  reference decoder reads it pixel-identically. `encoder/qmround.c` checks it
+  in `build.sh` (2,125 of 5,760 weights differ without 0012, none with it).
+  The other is the 4x4: the decoder derives it from the 8x8 at even rows and
+  columns, which misses AVM's own 4x4 by up to 0.23 octaves at levels 8 and
+  9, and the QM OBU has no room for one. `encoder/experiments/0013` adds an
+  optional 4x4 per level to the OBU and to the qm-file (y4x4, u4x4, v4x4).
+  It changes what the decoder reads, so it stays out of the build. With both,
+  a qm-file of AVM's own matrices decodes pixel-identically to the shipping
+  encode on all 64 encodes below, which leaves the OBU as the only cost:
+
+  | qm-file of AVM's own matrices | ssimulacra2 BD-rate | butteraugli BD-rate | held out (s2, bu) |
+  |---|---|---|---|
+  | as sent before (null) | +1.41% | +4.7% | +2.01%, +1.5% |
+  | with 0012 | +1.52% | +2.0% | +1.89%, +0.5% |
+  | with 0012, AVM's 4x4 in the 8x8 entries it samples | +1.42% | +3.9% | +2.37%, +4.2% |
+  | with 0012 and 0013's 4x4 line | +1.34% | +1.4% | +2.05%, +2.2% |
+
+  Crops and method as above (training at speed 6, held out at speed 3,
+  against shipping qmseg). The last row is bytes alone: 110 to 189 B a file,
+  1.3% of these crops on average, more on the small files at qp 125 that
+  BD-rate weighs as heavily as the large ones (samsung5's +8.8%). Fixing the
+  forward weights and the 4x4 moves ssimulacra2 by under 0.1%, inside the
+  noise, and butteraugli by up to 3 points on the training crops but either
+  way held out. So the OBU carries the whole cost, and its size is fixed:
+  120 to 180 B against a 100 KB photo would be 0.1 to 0.2%, an order smaller
+  than on these 320px crops. A matrix shape now has to beat that, and 0012
+  stays in the build because it makes a qm-file quantize as its matrices
+  say.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
