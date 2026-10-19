@@ -395,11 +395,18 @@ Measured on an M3 Max with other work running, so read them as approximate.
   BD-rate weighs as heavily as the large ones (samsung5's +8.8%). Fixing the
   forward weights and the 4x4 moves ssimulacra2 by under 0.1%, inside the
   noise, and butteraugli by up to 3 points on the training crops but either
-  way held out. So the OBU carries the whole cost, and its size is fixed:
-  120 to 180 B against a 100 KB photo would be 0.1 to 0.2%, an order smaller
-  than on these 320px crops. A matrix shape now has to beat that, and 0012
-  stays in the build because it makes a qm-file quantize as its matrices
-  say.
+  way held out. So the OBU carries the whole cost, and its size is fixed.
+  The site ships every photo at 600x600, and its full-tier AVIFs (AV1 today)
+  run 24 KB at the median, 10 KB at the 10th percentile and 48 KB at the
+  90th, so 118 to 182 B is 0.5 to 0.8% of a median photo and up to 1.8% of a
+  small one: about half its share of these crops. A matrix shape has to
+  beat that, and 0012 stays in the build because it makes a qm-file
+  quantize as its matrices say.
+- **jpegli matrices at full size, 2026-10-19.** The same qm-files on whole
+  photos with 0012: 8 of the site's own 600px photos, and the two 12 MP
+  camera originals (samsung5 and samsung6), at speed 6. Each jpegli shape
+  is judged against AVM's own matrices sent the same way, so both carry the
+  OBU and only the shape differs. Results are being measured and land here.
 - **Measured and dropped:** `-mcpu=native` (no change) and more than four
   encoder threads per tile (no faster).
 
