@@ -45,7 +45,7 @@
 #   ./build.sh --tuned    ALSO build build/tuned: the same pin plus patches/ and
 #                         the SIMDe kernels (see "THE TUNED BUILD" below)
 #
-# THE TUNED BUILD. patches/ holds eleven encoder-only changes to AVM, each off by
+# THE TUNED BUILD. patches/ holds twelve encoder-only changes to AVM, each off by
 # default and each decoded pixel-identically by the untouched reference decoder:
 #   0001 base-delta-q    the sequence DC/chroma offsets the encoder hard-zeroes
 #   0002 variance-boost  deltaq-mode=3, libaom/SVT-AV1 Variance Boost on AV2 q
@@ -75,6 +75,12 @@
 #   0011 qm-file         qm-file=<file>: user-defined quantization matrices per
 #                        level, sent in AV2's QM OBU (they shape transforms up
 #                        to 8x8; AV2 keeps its own for larger ones)
+#   0012 qm-round        a qm-file's forward weights round 1024 / iwt, as AVM's
+#                        predefined ones do, instead of truncating it (38% of
+#                        entries moved, so AVM's own matrices sent back
+#                        quantized differently); qmround.c checks it
+# experiments/ holds patches that change what the decoder reads, so they never
+# join this build: 0013 qm-4x4 adds an optional 4x4 matrix to the QM OBU.
 # Then simde.ts compiles AVM's own AVX2 kernels for arm64 through SIMDe. The build
 # refuses to finish unless the tuned binary, with every new option off, writes
 # BYTE-IDENTICAL files to the pristine one, and the pristine decoder reads a
@@ -321,4 +327,10 @@ st=$?
 set -e
 [ "$st" = 1 ] && grep -q "qm-file: level 8 y8x8 needs" "$GATE/bad.log" || {
   echo "error: a qm-file value under 5 was not refused cleanly (exit $st)" >&2; exit 1; }
-echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips; seg-map decodes inside superblocks; qm-file changes only the level it replaces)"
+# 0012: AVM's own matrices loaded as a qm-file must give AVM's own forward
+# weights at every size but 4x4 (which AV2 derives from the 8x8).
+cc -O1 -c -I"$TSRC" -I"$TUNED/_deps/libavm-build" "$SCRIPT_DIR/qmround.c" -o "$GATE/qmround.o"
+c++ -o "$GATE/qmround" "$GATE/qmround.o" "$TUNED/_deps/libavm-build/libavm.a" -lm -lpthread
+"$GATE/qmround" >&2 || {
+  echo "error: a qm-file of AVM's own matrices quantizes differently from them" >&2; exit 1; }
+echo "built: $TUNED/avifenc (gate: identical with options off; qmseg, tool-unlock and iq-deltaq decode identically; lambda-map round-trips; seg-map decodes inside superblocks; qm-file changes only the level it replaces and quantizes AVM's own matrices as AVM does)"
