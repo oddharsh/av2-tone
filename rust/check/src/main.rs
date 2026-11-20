@@ -25,6 +25,14 @@
 //! the AVM function and line that read it. --coverage then lists every AVM
 //! read site the files reached, with its symbol count.
 //!
+//! With --dequant it diffs every transform block's coefficients as they reach
+//! the inverse transform: av2-tone's (dequantized, after CCTX) against
+//! av2xform's dump of AVM's av2_inverse_transform_block calls. Blocks are
+//! matched by plane and position; size, type, eob and every coefficient must
+//! agree, and the first that doesn't is printed.
+//!
+//!   cargo run --release -p av2-check -- [--oracle <path>] --dequant <dir>...
+//!
 //! Exits 1 on any difference, any decode error, or any panic in av2-tone (a
 //! panic is a bug: the decoder must return an error instead). --headers lets
 //! pixel differences through, for while reconstruction is still being built;
@@ -348,12 +356,149 @@ fn entropy(oracle: &Path, streams: u32, ops: u32) -> ExitCode {
     if failed > 0 || !every_size { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
+/// One av2_inverse_transform_block call, from av2xform.
+struct AvmTxb {
+    tx_size: u8,
+    tx_type: u16,
+    eob: u16,
+    /// Nonzero coefficients, by index.
+    coeffs: Vec<(usize, i32)>,
+}
+
+fn run_xform(bin: &Path, obu: &Path) -> Result<BTreeMap<(u8, u32, u32), AvmTxb>, String> {
+    let out = Command::new(bin).arg(obu).output().map_err(|e| format!("{}: {e}", bin.display()))?;
+    if !out.status.success() {
+        return Err(format!("av2xform: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut blocks = BTreeMap::new();
+    let mut lines = text.lines();
+    let num = |f: Option<&str>| -> Result<i64, String> {
+        f.and_then(|v| v.parse().ok()).ok_or_else(|| "av2xform: unreadable number".to_string())
+    };
+    while let Some(line) = lines.next() {
+        let mut f = line.split(' ');
+        if f.next() != Some("txb") {
+            continue;
+        }
+        let (plane, x, y) = (num(f.next())? as u8, num(f.next())? as u32, num(f.next())? as u32);
+        let (tx_size, tx_type, eob) = (num(f.next())? as u8, num(f.next())? as u16, num(f.next())? as u16);
+        let dq = lines.next().ok_or("av2xform: a txb without its dq line")?;
+        let mut coeffs = Vec::new();
+        for kv in dq.split(' ').skip(2) {
+            let (k, v) = kv.split_once(':').ok_or("av2xform: unreadable coefficient")?;
+            coeffs.push((num(Some(k))? as usize, num(Some(v))? as i32));
+        }
+        // AVM returns at once for eob 0 (an inter-style block that coded
+        // nothing); there is nothing of it to compare.
+        if eob > 0 && blocks.insert((plane, x, y), AvmTxb { tx_size, tx_type, eob, coeffs }).is_some() {
+            return Err(format!("av2xform: two transform blocks at plane {plane} ({x}, {y})"));
+        }
+    }
+    Ok(blocks)
+}
+
+fn diff_txb(ours: &av2_tone::recon::TxBlock, avm: &AvmTxb) -> Option<String> {
+    if (ours.tx_size, ours.tx_type, ours.eob) != (avm.tx_size, avm.tx_type, avm.eob) {
+        return Some(format!(
+            "tx_size/tx_type/eob: av2-tone {}/{}/{}, AVM {}/{}/{}",
+            ours.tx_size, ours.tx_type, ours.eob, avm.tx_size, avm.tx_type, avm.eob
+        ));
+    }
+    let nz: Vec<(usize, i32)> =
+        ours.coeffs.iter().enumerate().filter(|(_, v)| **v != 0).map(|(i, v)| (i, *v)).collect();
+    let n = nz.iter().zip(&avm.coeffs).take_while(|(a, b)| a == b).count();
+    if n == nz.len() && n == avm.coeffs.len() {
+        return None;
+    }
+    let show = |c: Option<&(usize, i32)>| c.map_or("none".to_string(), |(i, v)| format!("[{i}] = {v}"));
+    Some(format!("nonzero coefficient {n}: av2-tone {}, AVM {}", show(nz.get(n)), show(avm.coeffs.get(n))))
+}
+
+fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path) -> ExitCode {
+    let (mut checked, mut full, mut blocks, mut same) = (0, 0, 0usize, 0usize);
+    let mut failed = false;
+    for path in files.values() {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let Ok(obu) = std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|f| av2_tone::avif::primary_item(&f).map_err(|e| e.to_string()))
+        else {
+            continue;
+        };
+        checked += 1;
+        let obu_path = work.join("item.obu");
+        if std::fs::write(&obu_path, &obu).is_err() {
+            continue;
+        }
+        let avm = match run_xform(xform, &obu_path) {
+            Ok(a) => a,
+            Err(e) => {
+                println!("ERROR {name}: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        let ours = match std::panic::catch_unwind(|| av2_tone::recon::transform_blocks(&obu)) {
+            Ok(Ok((_, b))) => b,
+            Ok(Err(e)) => {
+                println!("ERROR {name}: av2-tone: {e}");
+                failed = true;
+                continue;
+            }
+            Err(_) => {
+                println!("PANIC {name}: av2-tone panicked, which is a bug");
+                failed = true;
+                continue;
+            }
+        };
+        let mut first: Option<String> = None;
+        let mut ok = 0;
+        for b in &ours {
+            let key = (b.plane, b.x, b.y);
+            match avm.get(&key) {
+                Some(a) => match diff_txb(b, a) {
+                    None => ok += 1,
+                    Some(d) => {
+                        first.get_or_insert_with(|| format!("plane {} ({}, {}): {d}", b.plane, b.x, b.y));
+                    }
+                },
+                None => {
+                    first
+                        .get_or_insert_with(|| format!("plane {} ({}, {}): AVM has no block there", b.plane, b.x, b.y));
+                }
+            }
+        }
+        if ours.len() < avm.len() {
+            let have: std::collections::BTreeSet<_> = ours.iter().map(|b| (b.plane, b.x, b.y)).collect();
+            if let Some(k) = avm.keys().find(|k| !have.contains(k)) {
+                first.get_or_insert_with(|| format!("plane {} ({}, {}): av2-tone has no block there", k.0, k.1, k.2));
+            }
+        }
+        blocks += avm.len();
+        same += ok;
+        if first.is_none() && ours.len() == avm.len() {
+            full += 1;
+            println!("{name:44} all {} transform blocks match", avm.len());
+        } else {
+            failed = true;
+            println!("{name:44} {ok} of {} transform blocks match", avm.len());
+            if let Some(d) = first {
+                println!("    first difference: {d}");
+            }
+        }
+    }
+    println!("{checked} files: {full} with every transform block identical to AVM; {same} of {blocks} blocks match");
+    if failed || checked == 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let mut oracle = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../build/av2oracle"));
     let mut headers_only = false;
     let mut entropy_streams = None;
     let mut trace_mode = false;
+    let mut dequant_mode = false;
     let mut coverage = false;
     let mut ops = 4000;
     let mut dirs = Vec::new();
@@ -362,6 +507,7 @@ fn main() -> ExitCode {
             "--oracle" => oracle = args.next().map(PathBuf::from).unwrap_or_default(),
             "--headers" => headers_only = true,
             "--trace" => trace_mode = true,
+            "--dequant" => dequant_mode = true,
             "--coverage" => coverage = true,
             "--entropy" => entropy_streams = args.next().and_then(|n| n.parse::<u32>().ok()),
             "--ops" => ops = args.next().and_then(|n| n.parse().ok()).unwrap_or(ops),
@@ -400,6 +546,16 @@ fn main() -> ExitCode {
         }
     }
 
+    if dequant_mode {
+        let xform = oracle.with_file_name("av2xform");
+        if !xform.exists() {
+            eprintln!("missing {}: run rust/oracle/build.sh (on a system whose linker has --wrap)", xform.display());
+            return ExitCode::from(2);
+        }
+        let code = dequant(&xform, &files, &work);
+        let _ = std::fs::remove_dir_all(&work);
+        return code;
+    }
     if trace_mode {
         let tracer = oracle.with_file_name("av2trace");
         if !tracer.exists() {

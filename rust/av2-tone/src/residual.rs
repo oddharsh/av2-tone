@@ -4,7 +4,8 @@
 //! decode_reconstruct_tx (av2/decoder/decodeframe.c), av2_read_tx_type,
 //! av2_read_sec_tx_type and av2_read_cctx_type (decodemv.c), and the
 //! entropy-context and tx-type helpers they use (blockd.h, txb_common.h,
-//! entropy.h, reconintra.h). The coefficients themselves are in txb.rs.
+//! entropy.h, reconintra.h). The coefficients themselves are in txb.rs; each
+//! coded block leaves here dequantized (dequant.rs) as a recon::TxBlock.
 //!
 //! Only TX_MODE_LARGEST is ported: every block uses one transform of its
 //! largest size, so no transform partition is ever read. Lossless segments
@@ -16,6 +17,7 @@ use crate::block::{Mi, Xd, adjusted_tx_size, t2_1};
 use crate::cdf_tables::*;
 use crate::error::{Error, Result};
 use crate::parse::{FrameParse, TileState};
+use crate::recon::TxBlock;
 
 /// ENTROPY_CONTEXT, per plane: one byte per 4x4 column of the frame
 /// (above) and per 4x4 row of the superblock (left). Each holds the
@@ -33,6 +35,13 @@ impl EntropyContexts {
 }
 
 /// TXB_CTX.
+/// A coded transform block on its way to reconstruction.
+pub(crate) struct Coded {
+    coeffs: Vec<i32>,
+    eob: usize,
+    tx_type: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TxbCtx {
     pub skip: usize,
@@ -347,7 +356,8 @@ impl FrameParse<'_> {
         let tx = t(&MAX_TXSIZE_RECT_LOOKUP, pb)?;
         if plane == 0 {
             if row < unit_h && col < unit_w && !skip {
-                self.read_coeffs(ts, xd, 0, row, col, tx)?;
+                let coded = self.read_coeffs(ts, xd, 0, row, col, tx)?;
+                self.record(xd, 0, row, col, tx, coded)?;
             }
             return Ok(());
         }
@@ -362,10 +372,7 @@ impl FrameParse<'_> {
         let (step_r, step_c) = (t(&TX_SIZE_HIGH_UNIT, tx)?, t(&TX_SIZE_WIDE_UNIT, tx)?);
         for blk_row in ((row >> sy)..unit_h).step_by(step_r) {
             for blk_col in ((col >> sx)..unit_w).step_by(step_c) {
-                if plane == 2 && cctx {
-                    self.read_coeffs(ts, xd, 1, blk_row, blk_col, tx)?;
-                }
-                self.read_coeffs(ts, xd, plane, blk_row, blk_col, tx)?;
+                self.chroma_coeffs(ts, xd, plane, cctx, blk_row, blk_col, tx)?;
             }
         }
         Ok(())
@@ -394,16 +401,87 @@ impl FrameParse<'_> {
                 if blk_row >= max_h || blk_col >= max_w {
                     continue;
                 }
-                if plane == 2 && cctx {
-                    self.read_coeffs(ts, xd, 1, blk_row, blk_col, tx)?;
+                if plane == 0 {
+                    let coded = self.read_coeffs(ts, xd, 0, blk_row, blk_col, tx)?;
+                    self.record(xd, 0, blk_row, blk_col, tx, coded)?;
+                } else {
+                    self.chroma_coeffs(ts, xd, plane, cctx, blk_row, blk_col, tx)?;
                 }
-                self.read_coeffs(ts, xd, plane, blk_row, blk_col, tx)?;
             }
         }
         Ok(())
     }
 
-    /// av2_read_coeffs_txb_facade: one transform block.
+    /// One chroma transform block, or under CCTX the U and V blocks at the
+    /// same place (read U then V, then rotated together). AVM reconstructs U
+    /// when it coded anything, and V when it did or when CCTX carries U's
+    /// coefficients into it; both inverse transforms see the larger eob.
+    #[allow(clippy::too_many_arguments)]
+    fn chroma_coeffs(
+        &mut self,
+        ts: &mut TileState,
+        xd: &Xd,
+        plane: usize,
+        cctx: bool,
+        row: usize,
+        col: usize,
+        tx: usize,
+    ) -> Result<()> {
+        if !(plane == 2 && cctx) {
+            let coded = self.read_coeffs(ts, xd, plane, row, col, tx)?;
+            return self.record(xd, plane, row, col, tx, coded);
+        }
+        let u = self.read_coeffs(ts, xd, 1, row, col, tx)?;
+        let v = self.read_coeffs(ts, xd, 2, row, col, tx)?;
+        let kind = self.cctx_at(xd, row, col)?;
+        let (eu, ev) = (u.as_ref().map_or(0, |b| b.eob), v.as_ref().map_or(0, |b| b.eob));
+        let eob = eu.max(ev);
+        let n = max_eob(tx)?;
+        let mut u = u.unwrap_or_else(|| Coded { coeffs: vec![0; n], eob: 0, tx_type: 0 });
+        let mut v = v.unwrap_or_else(|| Coded { coeffs: vec![0; n], eob: 0, tx_type: 0 });
+        self.dq.cross_chroma(&mut u.coeffs, &mut v.coeffs, tx, kind)?;
+        let (keep_u, keep_v) = (eu > 0, ev > 0 || (kind != CCTX_NONE && eu > 0));
+        u.tx_type = self.tx_type(xd, 1, row, col, tx)?;
+        v.tx_type = self.tx_type(xd, 2, row, col, tx)?;
+        u.eob = eob;
+        v.eob = eob;
+        self.record(xd, 1, row, col, tx, keep_u.then_some(u))?;
+        self.record(xd, 2, row, col, tx, keep_v.then_some(v))
+    }
+
+    /// av2_get_cctx_type: what set_cctx left for this chroma transform block.
+    fn cctx_at(&self, xd: &Xd, row: usize, col: usize) -> Result<usize> {
+        let (sx, sy) = (self.f.ss_x, self.f.ss_y);
+        let cr = self.grid.mi(xd.cur)?.chroma_ref;
+        let i = self.grid.idx(cr.mi_row_base + (row << sy), cr.mi_col_base + (col << sx))?;
+        Ok(usize::from(*self.cctx_type_map.at(i)?))
+    }
+
+    /// Keeps a coded transform block for reconstruction, placed in its plane
+    /// as mi_to_pixel_loc places it.
+    fn record(&mut self, xd: &Xd, plane: usize, row: usize, col: usize, tx: usize, coded: Option<Coded>) -> Result<()> {
+        let Some(c) = coded.filter(|c| c.eob > 0) else { return Ok(()) };
+        let (sx, sy) = self.ss(plane);
+        let (r0, c0) = if plane > 0 {
+            let cr = &self.grid.mi(xd.cur)?.chroma_ref;
+            (cr.mi_row_base, cr.mi_col_base)
+        } else {
+            (xd.mi_row, xd.mi_col)
+        };
+        self.blocks.push(TxBlock {
+            plane: plane as u8,
+            x: ((((c0 >> sx) + col) << MI_SIZE_LOG2) as u32),
+            y: ((((r0 >> sy) + row) << MI_SIZE_LOG2) as u32),
+            tx_size: tx as u8,
+            tx_type: c.tx_type as u16,
+            eob: c.eob as u16,
+            coeffs: c.coeffs,
+        });
+        Ok(())
+    }
+
+    /// av2_read_coeffs_txb_facade: one transform block. Returns its
+    /// coefficients, dequantized, when it coded any.
     fn read_coeffs(
         &mut self,
         ts: &mut TileState,
@@ -412,7 +490,7 @@ impl FrameParse<'_> {
         row: usize,
         col: usize,
         tx: usize,
-    ) -> Result<()> {
+    ) -> Result<Option<Coded>> {
         let pt = usize::from(self.tree_type == CHROMA_PART);
         let (inter, fsc) = {
             let m = self.grid.mi(xd.cur)?;
@@ -424,15 +502,27 @@ impl FrameParse<'_> {
         let eob = self.read_sig_txtype(ts, xd, row, col, plane, ctx, tx)?;
         let tx_type = self.tx_type(xd, plane, row, col, tx)?;
         let mut cul_level = 0;
+        let mut coded = None;
         if let Some(eob) = eob {
             let idtx_fsc = enable_fsc && fsc && primary(tx_type) == IDTX && plane == 0;
             // use_inter_fsc compares the whole type, secondary bits included.
             let inter_fsc = enable_fsc && plane == 0 && inter && tx_type == IDTX;
-            cul_level = if idtx_fsc || inter_fsc {
-                self.read_coeffs_txb_skip(ts, xd, row, col, plane, tx, eob)?
+            let mut coeffs = vec![0; max_eob(tx)?];
+            // The secondary-transform read inside read_coeffs_txb can
+            // change the type, so the scan and dequantization take it after.
+            let (eob, tcq) = if idtx_fsc || inter_fsc {
+                cul_level = self.read_coeffs_txb_skip(ts, xd, row, col, plane, tx, eob, &mut coeffs)?;
+                (max_eob(tx)?, false)
             } else {
-                self.read_coeffs_txb(ts, xd, row, col, plane, ctx, tx, eob)?
+                cul_level = self.read_coeffs_txb(ts, xd, row, col, plane, ctx, tx, eob, &mut coeffs)?;
+                let class = t(&TX_TYPE_TO_CLASS, primary(self.tx_type(xd, plane, row, col, tx)?))?;
+                (eob, self.h.frame.tcq_mode != 0 && plane == 0 && class == TX_CLASS_2D)
             };
+            let tx_type = self.tx_type(xd, plane, row, col, tx)?;
+            let segment = self.grid.mi(xd.cur)?.segment_id;
+            let scan = Self::scan(tx, tx_type)?;
+            self.dq.apply(&mut coeffs, scan, eob, segment, plane, tx, tx_type, tcq)?;
+            coded = Some(Coded { coeffs, eob, tx_type });
         }
         self.set_entropy_contexts(xd, plane, pb, tx, cul_level, col, row)?;
         if inter && plane == 0 {
@@ -446,7 +536,7 @@ impl FrameParse<'_> {
                 }
             }
         }
-        Ok(())
+        Ok(coded)
     }
 
     /// get_txb_ctx.

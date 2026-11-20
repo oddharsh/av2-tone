@@ -43,6 +43,7 @@ const INCLUDES = [
   "av2/common/ccso.h",
   "av2/common/gdf.h",
   "av2/common/secondary_tx.h",
+  "av2/common/av2_txfm.h",
 ];
 
 // #define constants to evaluate (the preprocessor erases macros, so they are
@@ -70,6 +71,8 @@ const DEFINES = [
   "SECONDARY_TX_BITS", "INTER_TX_TYPE_INDEX_COUNT", "INTER_TX_TYPE_OFFSET1_COUNT", "INTER_TX_TYPE_OFFSET2_COUNT",
   "STX_TYPES", "WAIP_WH_RATIO_2_THRES", "WAIP_WH_RATIO_4_THRES", "WAIP_WH_RATIO_8_THRES", "WAIP_WH_RATIO_16_THRES",
   "ANGLE_STEP", "MAX_VAL_BR_CTX", "TCQ_MAX_STATES", "EXT_TX_SETS_INTRA", "EXT_TX_SIZES", "INTRA_TX_SET1",
+  "QUANT_TABLE_BITS", "AVM_QM_BITS", "NUM_QM_LEVELS", "QM_TOTAL_SIZE", "MAXQ", "MAXQ_8_BITS", "MAXQ_10_BITS",
+  "CCTX_PREC_BITS",
 ];
 
 // [Rust name, C expression]. Plain arrays get their shape from sizeof; an
@@ -126,6 +129,8 @@ const TABLES: [string, string][] = [
   ["MODE_TO_ANGLE_MAP", "mode_to_angle_map"],
   ["AV2_EOB_GROUP_START", "av2_eob_group_start"],
   ["AV2_EOB_OFFSET_BITS", "av2_eob_offset_bits"],
+  ["PREDEFINED_IWT_MATRIX_REF", "predefined_iwt_matrix_ref"],
+  ["CCTX_MTX", "cctx_mtx"],
 ];
 
 function sh(cmd: string[], cwd?: string): string {
@@ -216,6 +221,11 @@ ${tables
   printf("\\n");`;
   })
   .join("\n")}
+  // ac_qlookup_QTX is static, so the quantizer table comes from AVM's own
+  // av2_ac_quant_QTX: at 12 bits nothing clamps, and get_q is qlookup.
+  printf("qlookup %d", MAXQ + 1);
+  for (int q = 0; q <= MAXQ; q++) printf(" %d", av2_ac_quant_QTX(q, 0, 0, AVM_BITS_12));
+  printf("\\n");
   // av2_scan_orders: each [tx_size][tx_type] scan, as long as the largest eob.
   for (int s = 0; s < TX_SIZES_ALL; s++)
     for (int t = 0; t < TX_TYPES; t++) {
@@ -258,6 +268,12 @@ for (const line of out) {
       scanData.push(...vals);
     }
     (scanStart[sz] ??= [])[ty] = scanAt.get(key)!;
+    continue;
+  }
+  if (f[0] === "qlookup") {
+    const vals = f.slice(2).map(Number);
+    if (vals.length !== Number(f[1])) die(`qlookup: ${vals.length} of ${f[1]} values`);
+    tabs.push({ rust: "Q_LOOKUP", dims: [vals.length], vals, c: "av2_ac_quant_QTX(q, 0, 0, AVM_BITS_12) for q in 0..=MAXQ: qlookup()" });
     continue;
   }
   if (f[0] === "define") {

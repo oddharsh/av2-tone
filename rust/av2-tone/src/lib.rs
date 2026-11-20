@@ -10,8 +10,11 @@
 //! with [`Error::Unsupported`] naming what it was. Built so far: the AVIF
 //! container, OBU framing, the sequence header and the key frame's header,
 //! the arithmetic decoder with AVM's CDF adaptation, the default CDFs
-//! (generated from AVM), and each tile's starting entropy state. Partition
-//! and mode parsing comes next, then the rest of reconstruction.
+//! (generated from AVM), each tile's starting entropy state, the whole tile
+//! parse (partitions, modes and coefficients), and dequantization: what
+//! [`recon::transform_blocks`] returns is what AVM's inverse transform
+//! receives, block for block. The inverse transforms come next, then
+//! prediction and the loop filters.
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +28,7 @@ mod block;
 pub mod cdf;
 #[rustfmt::skip]
 pub mod cdf_tables;
+mod dequant;
 pub mod dump;
 pub mod entropy;
 pub mod error;
@@ -32,6 +36,7 @@ pub mod frame;
 pub mod obu;
 pub mod parse;
 mod partition;
+pub mod recon;
 mod residual;
 pub mod seq;
 pub mod tile;
