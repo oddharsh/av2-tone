@@ -33,6 +33,13 @@
 //!
 //!   cargo run --release -p av2-check -- [--oracle <path>] --dequant <dir>...
 //!
+//! --recon adds the inverse transforms to that: once a block's coefficients
+//! match, AVM's prediction plus av2-tone's residual (src/itx.rs), clipped to
+//! the bit depth, must equal AVM's reconstruction of the block, sample for
+//! sample. The prediction is AVM's, so this checks the transforms alone.
+//!
+//!   cargo run --release -p av2-check -- [--oracle <path>] --recon <dir>...
+//!
 //! Exits 1 on any difference, any decode error, or any panic in av2-tone (a
 //! panic is a bug: the decoder must return an error instead). --headers lets
 //! pixel differences through, for while reconstruction is still being built;
@@ -363,6 +370,11 @@ struct AvmTxb {
     eob: u16,
     /// Nonzero coefficients, by index.
     coeffs: Vec<(usize, i32)>,
+    use_ddt: bool,
+    /// The destination before and after AVM's inverse transform: the
+    /// prediction, then the reconstruction.
+    pred: Vec<u16>,
+    recon: Vec<u16>,
 }
 
 fn run_xform(bin: &Path, obu: &Path) -> Result<BTreeMap<(u8, u32, u32), AvmTxb>, String> {
@@ -383,15 +395,28 @@ fn run_xform(bin: &Path, obu: &Path) -> Result<BTreeMap<(u8, u32, u32), AvmTxb>,
         }
         let (plane, x, y) = (num(f.next())? as u8, num(f.next())? as u32, num(f.next())? as u32);
         let (tx_size, tx_type, eob) = (num(f.next())? as u8, num(f.next())? as u16, num(f.next())? as u16);
+        let use_ddt = num(f.next())? != 0;
         let dq = lines.next().ok_or("av2xform: a txb without its dq line")?;
         let mut coeffs = Vec::new();
         for kv in dq.split(' ').skip(2) {
             let (k, v) = kv.split_once(':').ok_or("av2xform: unreadable coefficient")?;
             coeffs.push((num(Some(k))? as usize, num(Some(v))? as i32));
         }
+        let mut samples = |key: &str| -> Result<Vec<u16>, String> {
+            let l = lines.next().ok_or_else(|| format!("av2xform: a txb without its {key} line"))?;
+            let mut f = l.split(' ');
+            if f.next() != Some(key) {
+                return Err(format!("av2xform: expected a {key} line"));
+            }
+            f.map(|v| v.parse().map_err(|_| "av2xform: unreadable sample".to_string())).collect()
+        };
+        let pred = samples("pred")?;
+        let recon = samples("recon")?;
         // AVM returns at once for eob 0 (an inter-style block that coded
         // nothing); there is nothing of it to compare.
-        if eob > 0 && blocks.insert((plane, x, y), AvmTxb { tx_size, tx_type, eob, coeffs }).is_some() {
+        if eob > 0
+            && blocks.insert((plane, x, y), AvmTxb { tx_size, tx_type, eob, coeffs, use_ddt, pred, recon }).is_some()
+        {
             return Err(format!("av2xform: two transform blocks at plane {plane} ({x}, {y})"));
         }
     }
@@ -415,7 +440,44 @@ fn diff_txb(ours: &av2_tone::recon::TxBlock, avm: &AvmTxb) -> Option<String> {
     Some(format!("nonzero coefficient {n}: av2-tone {}, AVM {}", show(nz.get(n)), show(avm.coeffs.get(n))))
 }
 
-fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path) -> ExitCode {
+/// --recon's test for one block whose coefficients already match: AVM's
+/// prediction plus av2-tone's residual, clipped to the bit depth, must be
+/// AVM's reconstruction sample for sample.
+fn diff_recon(ours: &av2_tone::recon::TxBlock, avm: &AvmTxb, bd: u32) -> Option<String> {
+    if avm.use_ddt {
+        return Some("AVM used a data-driven transform, which av2-tone has no kernels for".into());
+    }
+    let res = match av2_tone::itx::residual(ours, bd) {
+        Ok(r) => r,
+        Err(e) => return Some(format!("av2-tone: {e}")),
+    };
+    if res.len() != avm.pred.len() || res.len() != avm.recon.len() {
+        return Some(format!(
+            "{} residual samples, AVM {} predicted and {} reconstructed",
+            res.len(),
+            avm.pred.len(),
+            avm.recon.len()
+        ));
+    }
+    let w = av2_tone::avm_defs::TX_SIZE_WIDE.get(usize::from(ours.tx_size)).map_or(1, |&w| w as usize);
+    let max = (1i32 << bd) - 1;
+    for (i, ((&r, &p), &want)) in res.iter().zip(&avm.pred).zip(&avm.recon).enumerate() {
+        let got = (i32::from(p) + r).clamp(0, max);
+        if got != i32::from(want) {
+            return Some(format!(
+                "sample ({}, {}) of {}x{}: prediction {p} + residual {r} = {got}, AVM reconstructed {want} (residual {})",
+                i % w,
+                i / w,
+                w,
+                res.len() / w,
+                i32::from(want) - i32::from(p)
+            ));
+        }
+    }
+    None
+}
+
+fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path, recon: bool) -> ExitCode {
     let (mut checked, mut full, mut blocks, mut same) = (0, 0, 0usize, 0usize);
     let mut failed = false;
     for path in files.values() {
@@ -439,8 +501,11 @@ fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path) -> Exi
                 continue;
             }
         };
-        let ours = match std::panic::catch_unwind(|| av2_tone::recon::transform_blocks(&obu)) {
-            Ok(Ok((_, b))) => b,
+        let what = if recon { "reconstructed" } else { "transform" };
+        let ours = match std::panic::catch_unwind(|| {
+            av2_tone::recon::transform_blocks(&obu).map(|(h, b)| (h.seq.bit_depth, b))
+        }) {
+            Ok(Ok(b)) => b,
             Ok(Err(e)) => {
                 println!("ERROR {name}: av2-tone: {e}");
                 failed = true;
@@ -452,12 +517,13 @@ fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path) -> Exi
                 continue;
             }
         };
+        let (bd, ours) = ours;
         let mut first: Option<String> = None;
         let mut ok = 0;
         for b in &ours {
             let key = (b.plane, b.x, b.y);
             match avm.get(&key) {
-                Some(a) => match diff_txb(b, a) {
+                Some(a) => match diff_txb(b, a).or_else(|| if recon { diff_recon(b, a, bd) } else { None }) {
                     None => ok += 1,
                     Some(d) => {
                         first.get_or_insert_with(|| format!("plane {} ({}, {}): {d}", b.plane, b.x, b.y));
@@ -479,16 +545,17 @@ fn dequant(xform: &Path, files: &BTreeMap<PathBuf, PathBuf>, work: &Path) -> Exi
         same += ok;
         if first.is_none() && ours.len() == avm.len() {
             full += 1;
-            println!("{name:44} all {} transform blocks match", avm.len());
+            println!("{name:44} all {} {what} blocks match", avm.len());
         } else {
             failed = true;
-            println!("{name:44} {ok} of {} transform blocks match", avm.len());
+            println!("{name:44} {ok} of {} {what} blocks match", avm.len());
             if let Some(d) = first {
                 println!("    first difference: {d}");
             }
         }
     }
-    println!("{checked} files: {full} with every transform block identical to AVM; {same} of {blocks} blocks match");
+    let what = if recon { "reconstructed" } else { "transform" };
+    println!("{checked} files: {full} with every {what} block identical to AVM; {same} of {blocks} blocks match");
     if failed || checked == 0 { ExitCode::from(1) } else { ExitCode::SUCCESS }
 }
 
@@ -499,6 +566,7 @@ fn main() -> ExitCode {
     let mut entropy_streams = None;
     let mut trace_mode = false;
     let mut dequant_mode = false;
+    let mut recon_mode = false;
     let mut coverage = false;
     let mut ops = 4000;
     let mut dirs = Vec::new();
@@ -508,6 +576,7 @@ fn main() -> ExitCode {
             "--headers" => headers_only = true,
             "--trace" => trace_mode = true,
             "--dequant" => dequant_mode = true,
+            "--recon" => recon_mode = true,
             "--coverage" => coverage = true,
             "--entropy" => entropy_streams = args.next().and_then(|n| n.parse::<u32>().ok()),
             "--ops" => ops = args.next().and_then(|n| n.parse().ok()).unwrap_or(ops),
@@ -546,13 +615,13 @@ fn main() -> ExitCode {
         }
     }
 
-    if dequant_mode {
+    if dequant_mode || recon_mode {
         let xform = oracle.with_file_name("av2xform");
         if !xform.exists() {
             eprintln!("missing {}: run rust/oracle/build.sh (on a system whose linker has --wrap)", xform.display());
             return ExitCode::from(2);
         }
-        let code = dequant(&xform, &files, &work);
+        let code = dequant(&xform, &files, &work, recon_mode);
         let _ = std::fs::remove_dir_all(&work);
         return code;
     }
