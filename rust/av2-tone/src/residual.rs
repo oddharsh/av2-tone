@@ -462,6 +462,8 @@ impl FrameParse<'_> {
     fn record(&mut self, xd: &Xd, plane: usize, row: usize, col: usize, tx: usize, coded: Option<Coded>) -> Result<()> {
         let Some(c) = coded.filter(|c| c.eob > 0) else { return Ok(()) };
         let (sx, sy) = self.ss(plane);
+        let m = self.grid.mi(xd.cur)?;
+        let (mode, inter) = (intra_mode(m, plane)? as u8, m.is_inter(self.tree_type));
         let (r0, c0) = if plane > 0 {
             let cr = &self.grid.mi(xd.cur)?.chroma_ref;
             (cr.mi_row_base, cr.mi_col_base)
@@ -476,6 +478,8 @@ impl FrameParse<'_> {
             tx_type: c.tx_type as u16,
             eob: c.eob as u16,
             coeffs: c.coeffs,
+            mode,
+            inter,
         });
         Ok(())
     }

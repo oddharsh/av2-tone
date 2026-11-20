@@ -18,7 +18,7 @@ number below describes the pinned AVM and can move when the pin does.
 | `metal/` | AV2's GDF loop filter on the Apple GPU |
 | `fixture/` | a deterministic synthetic test frame, so nothing here depends on a photo |
 | `demo/` | encodes your photo as AV1 and AV2 at the same byte count, races the encoders and decoders on it, and shows both on a local page. [Usage](demo/README.md) |
-| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and its harness against pristine AVM. It parses every symbol and dequantizes every coefficient, but produces no pixels yet. [Details](rust/README.md) |
+| `rust/` | `av2-tone`, a safe-Rust still-image decoder, and its harness against pristine AVM. It parses every symbol and turns every transform block into its residual, but doesn't predict, so it produces no pixels yet. [Details](rust/README.md) |
 
 ## Build
 
@@ -76,10 +76,10 @@ Against pristine AVM 1.0.0:
 | tiles and their starting context | byte for byte on all 57 | matches |
 | tile parse | AVM's own symbol trace on all 57: 5,614,124 symbols across 107 read sites | matches |
 | dequantization (TCQ, quantization matrices, CCTX) | every transform block's coefficients as they reach AVM's inverse transform, on all 57: 32,667 blocks | matches |
+| inverse transforms (IST, then DCT, ADST, flipped ADST and identity, 4 to 64 points) | AVM's prediction plus av2-tone's residual against AVM's reconstruction, every sample of all 32,667 blocks | matches |
 | reconstruction | pixels | not built yet |
 
-Next: the inverse transforms (IST, then the primary ones), intra prediction,
-then deblocking, CDEF, CCSO, GDF and loop restoration.
+Next: intra prediction, then deblocking, CDEF, CCSO, GDF and loop restoration.
 
 ## Results
 

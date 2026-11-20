@@ -10,6 +10,7 @@
 #   cargo run --release -p av2-check -- --entropy 300
 #   cargo run --release -p av2-check -- --trace build/corpus
 #   cargo run --release -p av2-check -- --dequant build/corpus
+#   cargo run --release -p av2-check -- --recon build/corpus
 set -euo pipefail
 cd "$(dirname "$0")"
 cargo fmt --check

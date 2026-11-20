@@ -11,10 +11,10 @@
 //! container, OBU framing, the sequence header and the key frame's header,
 //! the arithmetic decoder with AVM's CDF adaptation, the default CDFs
 //! (generated from AVM), each tile's starting entropy state, the whole tile
-//! parse (partitions, modes and coefficients), and dequantization: what
+//! parse (partitions, modes and coefficients), dequantization (what
 //! [`recon::transform_blocks`] returns is what AVM's inverse transform
-//! receives, block for block. The inverse transforms come next, then
-//! prediction and the loop filters.
+//! receives, block for block) and the inverse transforms ([`itx::residual`]).
+//! Intra prediction comes next, then the loop filters.
 
 #![forbid(unsafe_code)]
 
@@ -33,6 +33,7 @@ pub mod dump;
 pub mod entropy;
 pub mod error;
 pub mod frame;
+pub mod itx;
 pub mod obu;
 pub mod parse;
 mod partition;

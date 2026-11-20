@@ -13,6 +13,7 @@ cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --headers ru
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --entropy 300
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --trace --coverage rust/build/corpus
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --dequant rust/build/corpus
+cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --recon rust/build/corpus
 bun rust/gen/cdf.ts           # regenerate the CDF tables (after oracle/build.sh)
 bun rust/gen/defs.ts          # regenerate AVM's constants and lookup tables
 ```
@@ -59,8 +60,18 @@ intra DIP. Speed 6 writes none of these.
   knowing: a segment's own matrix level reaches only transforms up to 8x8;
   larger ones take segment 0's level, so qmseg's level 12 never touches a
   16x16.
+- **The inverse transforms:** IST, AV2's secondary transform, as a reduced
+  4x4 or 8x8 matrix over the first coefficients in scan order; then the
+  primary row and column passes, each with its own shift and clamp, after a
+  1/sqrt(2) prescale for 2:1 blocks. 64-point sides run at 32 and repeat each
+  sample. AVM writes the DCTs as partial butterflies and the rest as matrix
+  products; `itx.rs` uses matrix products for all of them, which equals the
+  butterfly because the sums are exact (they wrap at 32 bits as AVM's `int`
+  does) and the DCT tables have the symmetry the butterfly assumes. A unit
+  test holds the tables to that. The data-driven transforms (DDTX, FDDT) are
+  left out: AVM uses them only for inter blocks, and a key frame has none.
 
-The pixels don't match yet: the inverse transforms and prediction come next.
+The pixels don't match yet: intra prediction comes next.
 
 ## How it's checked
 
@@ -98,6 +109,19 @@ fails 136, so the check sees both. ELF linkers have `--wrap` and Apple's ld
 doesn't, so on macOS `build.sh` skips `av2xform`.
 (`CONFIG_INSPECTION`'s coefficient dump can't stand in: `ifd_inspect_superblock`
 copies `MAX_SB_SQUARE` bytes of 4-byte coefficients, a quarter of them.)
+
+**`av2-check --recon`** takes the same dumps one step further: once a
+block's coefficients match, AVM's prediction plus av2-tone's residual,
+clipped to the bit depth, must be AVM's reconstruction, sample for sample.
+The prediction is AVM's, so the transforms are checked before prediction
+exists. The corpus reaches every 1-D kernel at every size AVM defines it,
+every 64-point shape but 4x64 and 64x4, and all four IST size classes, both
+scan orientations and an intra block copy block among them, though only
+188 blocks use IST. Planting a defect shows what the check sees: skipping
+IST fails 188 blocks, flipping its transpose 182, dropping the 1/sqrt(2)
+prescale 11,197, tiling 64-point sides instead of repeating samples 452,
+and dropping the rounding offset 29,028. Widening either clamp fails none:
+no block in the corpus reaches them, so they're ported but unverified.
 
 **The corpus** is the fixture frame at 8 and 10 bits, 4:2:0 and 4:4:4, and qp
 40, 105 and 180. Each runs at speed 6 four ways: plain, with `tool-unlock=6`, with qmseg,
