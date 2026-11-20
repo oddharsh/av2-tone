@@ -205,7 +205,7 @@ fn adaptive_param(ctx: i32) -> u32 {
 }
 
 /// tcq_next_state: an 8-state trellis stepped by each level's parity.
-fn tcq_next(state: i32, level: usize) -> i32 {
+pub(crate) fn tcq_next(state: i32, level: usize) -> i32 {
     let mode = state >> 8;
     if mode != 1 {
         return mode << 8;
@@ -270,12 +270,14 @@ impl FrameParse<'_> {
     }
 
     /// The scan for a transform size and type: av2_scan_orders[tx][primary].
-    fn scan(tx: usize, tx_type: usize) -> Result<&'static [u16]> {
+    pub(crate) fn scan(tx: usize, tx_type: usize) -> Result<&'static [u16]> {
         let start = t2(&SCAN_START, tx, primary(tx_type))?;
         SCAN.get(start..start + max_eob(tx)?).ok_or(Error::Invalid("scan order"))
     }
 
-    /// av2_read_coeffs_txb. Returns the cul_level for the entropy contexts.
+    /// av2_read_coeffs_txb. Writes each coefficient's signed level into
+    /// `coeffs` at its position (AVM's quantized coefficient, before
+    /// dequantization) and returns the cul_level for the entropy contexts.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_coeffs_txb(
         &mut self,
@@ -287,6 +289,7 @@ impl FrameParse<'_> {
         ctx: TxbCtx,
         tx: usize,
         eob: usize,
+        coeffs: &mut [i32],
     ) -> Result<u8> {
         let txs_ctx = txsize_entropy_ctx(tx)?;
         let tx_type = self.tx_type(xd, plane, row, col, tx)?;
@@ -470,6 +473,7 @@ impl FrameParse<'_> {
             if level >> 20 != 0 {
                 return Err(Error::Invalid("coefficient level beyond 20 bits"));
             }
+            *coeffs.at_mut(pos)? = if sign { -level } else { level };
             cul += i64::from(level);
         }
         Ok(cul_level(cul, dc_val))
@@ -477,7 +481,8 @@ impl FrameParse<'_> {
 
     /// av2_read_coeffs_txb_skip: forward-skip coding of an identity
     /// transform. The decoded eob marks where coding begins ("bob"); every
-    /// position from there to the end is coded.
+    /// position from there to the end is coded. Signed levels go into
+    /// `coeffs` as read_coeffs_txb writes them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_coeffs_txb_skip(
         &mut self,
@@ -488,6 +493,7 @@ impl FrameParse<'_> {
         plane: usize,
         tx: usize,
         bob_eob: usize,
+        coeffs: &mut [i32],
     ) -> Result<u8> {
         let adj = adjusted_tx_size(tx);
         let bwl = t(&TX_SIZE_WIDE_LOG2, adj)?;
@@ -570,6 +576,7 @@ impl FrameParse<'_> {
             if level >> 20 != 0 {
                 return Err(Error::Invalid("FSC coefficient level beyond 20 bits"));
             }
+            *coeffs.at_mut(pos)? = if sign { -level } else { level };
             cul += i64::from(level);
         }
         Ok(cul_level(cul, dc_val))

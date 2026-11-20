@@ -33,6 +33,7 @@
 
 #include "avm/avm_decoder.h"
 #include "avm/avmdx.h"
+#include "config/avm_dsp_rtcd.h"
 #include "avm_dsp/bitreader.h"
 #include "avm_dsp/entenc.h"
 #include "avm_dsp/prob.h"
@@ -265,6 +266,10 @@ static int pick(const avm_cdf_prob *cdf, int n) {
 }
 
 static int entropy_mode(uint32_t seed, int nops) {
+  // avm_od_ec_decode_cdf_q15 is a run-time CPU dispatch (avx2 or C) whose
+  // pointer avm_dsp_rtcd fills. Opening a decoder calls it; this mode opens
+  // none, so without this line the first symbol read jumps to null.
+  avm_dsp_rtcd();
   rng_state = seed * 2654435761u + 1;
   avm_cdf_prob enc_cdf[17][CDF_SIZE(16)], dec_cdf[17][CDF_SIZE(16)];
   for (int n = 2; n <= 16; n++) random_cdf(enc_cdf[n], n);

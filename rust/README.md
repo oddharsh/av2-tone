@@ -7,11 +7,12 @@ checked.
 
 ```bash
 rust/ci.sh                    # fmt, cargo test, clippy -D warnings
-rust/oracle/build.sh          # pristine AVM, decoder only, plus av2oracle and av2trace
+rust/oracle/build.sh          # pristine AVM, decoder only, plus av2oracle, av2trace and av2xform
 bun rust/corpus.ts            # 57 stills into rust/build/corpus (needs encoder/build.sh --tuned)
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --headers rust/build/corpus
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --entropy 300
 cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --trace --coverage rust/build/corpus
+cargo run --release --manifest-path rust/Cargo.toml -p av2-check -- --dequant rust/build/corpus
 bun rust/gen/cdf.ts           # regenerate the CDF tables (after oracle/build.sh)
 bun rust/gen/defs.ts          # regenerate AVM's constants and lookup tables
 ```
@@ -51,8 +52,15 @@ intra DIP. Speed 6 writes none of these.
   states, parity hiding, and the forward-skip path for identity transforms.
   AVM interleaves coefficients with modes block by block, so the parse can't
   stop short of them.
+- **Dequantization:** each segment's DC and AC steps, the quantization matrix
+  for the block's size, type and plane, TCQ's second pass (which walks the
+  scan back from the end of block and dequantizes one bit finer), and the
+  cross-chroma rotation CCTX applies to a U/V pair. One AVM detail worth
+  knowing: a segment's own matrix level reaches only transforms up to 8x8;
+  larger ones take segment 0's level, so qmseg's level 12 never touches a
+  16x16.
 
-The pixels don't match yet, because nothing is reconstructed.
+The pixels don't match yet: the inverse transforms and prediction come next.
 
 ## How it's checked
 
@@ -76,6 +84,20 @@ it, and `--coverage` lists every read site the corpus reached. Four stills keep
 streams over every alphabet size from 2 to 16, with adaptation on and off. The
 Rust decoder must recover every symbol, match AVM's `tell` after every
 operation, and end with AVM's CDFs.
+
+**`av2xform`** links pristine AVM with the linker's `--wrap` in front of
+`av2_inverse_transform_block`, the one call `decodeframe.c` makes per
+transform block. For each it prints the block's plane, position, size, type
+and eob, the dequantized coefficients AVM hands the inverse transform (after
+CCTX, before IST), and the destination samples before and after: the
+prediction, then the reconstruction. `av2-check --dequant` matches blocks by
+plane and position and refuses any difference in size, type, eob or a single
+coefficient. A run with the quantization matrices turned off fails 804 of
+1,333 blocks on a 3-file sample, and one with TCQ's extra shift dropped
+fails 136, so the check sees both. ELF linkers have `--wrap` and Apple's ld
+doesn't, so on macOS `build.sh` skips `av2xform`.
+(`CONFIG_INSPECTION`'s coefficient dump can't stand in: `ifd_inspect_superblock`
+copies `MAX_SB_SQUARE` bytes of 4-byte coefficients, a quarter of them.)
 
 **The corpus** is the fixture frame at 8 and 10 bits, 4:2:0 and 4:4:4, and qp
 40, 105 and 180. Each runs at speed 6 four ways: plain, with `tool-unlock=6`, with qmseg,

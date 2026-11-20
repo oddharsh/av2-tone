@@ -67,6 +67,9 @@ pub(crate) struct FrameParse<'h> {
     pub(crate) cctx_type_map: Vec<u8>,
     /// xd->eob_u_flag: whether the last U block coded any coefficient.
     pub(crate) eob_u_flag: bool,
+    pub(crate) dq: crate::dequant::Dequant,
+    /// Every transform block coded so far, in decode order.
+    pub(crate) blocks: Vec<crate::recon::TxBlock>,
 }
 
 /// One tile's reader and adapting CDFs.
@@ -121,6 +124,8 @@ impl<'h> FrameParse<'h> {
             tx_type_map: vec![0; maps],
             cctx_type_map: vec![0; maps],
             eob_u_flag: false,
+            dq: crate::dequant::Dequant::new(h)?,
+            blocks: Vec::new(),
             grid,
             seg_map: vec![0; f.mi_rows * f.mi_cols],
             has_lossless_segment: lossless.iter().any(|&l| l),
@@ -530,7 +535,12 @@ impl<'h> FrameParse<'h> {
 /// Parses every tile of the key frame, in AVM's order. With `trace`, records
 /// each symbol as AVM's accounting build would, carrying the block context
 /// across tiles as AVM's does.
-pub(crate) fn parse_tiles(h: &Headers, data: &[u8], mut trace: Option<&mut Vec<TraceSym>>) -> Result<()> {
+/// Parses every tile, returning the frame's transform blocks.
+pub(crate) fn parse_tiles(
+    h: &Headers,
+    data: &[u8],
+    mut trace: Option<&mut Vec<TraceSym>>,
+) -> Result<Vec<crate::recon::TxBlock>> {
     let mut fp = FrameParse::new(h)?;
     let fc = FrameContext::default_for(h.frame.quant.base_qindex, h.seq.reduced_tx_part_set)?;
     let allow_update = !h.frame.disable_cdf_update;
@@ -549,7 +559,7 @@ pub(crate) fn parse_tiles(h: &Headers, data: &[u8], mut trace: Option<&mut Vec<T
         }
         r?;
     }
-    Ok(())
+    Ok(fp.blocks)
 }
 
 /// What a traced parse produced: AVM-shaped symbol records for every tile, in
@@ -563,7 +573,8 @@ pub struct ParseTrace {
 /// as AVM's accounting build would.
 pub fn trace_obus(stream: &[u8]) -> ParseTrace {
     let mut syms = Vec::new();
-    let result = crate::parse_obus(stream).and_then(|(h, group)| parse_tiles(&h, group.data, Some(&mut syms)));
+    let result =
+        crate::parse_obus(stream).and_then(|(h, group)| parse_tiles(&h, group.data, Some(&mut syms)).map(|_| ()));
     ParseTrace { syms, result }
 }
 

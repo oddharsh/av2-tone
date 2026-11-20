@@ -1255,10 +1255,8 @@ fn color_index_ctx(map: &[u8], stride: usize, r: usize, c: usize) -> Result<(usi
     } else if c > 0 && r == 0 {
         put(&mut order, &mut status, 0, *map.at(r * stride + c - 1)?)?;
     }
-    let mut w = cnt;
-    for (i, _) in status.iter().enumerate().filter(|(_, s)| !**s) {
+    for (w, (i, _)) in (cnt..).zip(status.iter().enumerate().filter(|(_, s)| !**s)) {
         *order.at_mut(w)? = i as u8;
-        w += 1;
     }
     Ok((ctx, order))
 }
